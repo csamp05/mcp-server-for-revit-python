@@ -282,20 +282,35 @@ def tag_hangers_no_overlap(
                     continue
 
                 ref = DB.Reference(el)
-                # Create the tag WITHOUT a leader so its bounding box is the
-                # head only. Position it a default distance up to start.
                 init_hx, init_hy = cx, cy + radii[0]
                 tag = DB.IndependentTag.Create(
                     doc, tag_symbol.Id, view.Id, ref, False,
                     DB.TagOrientation.Horizontal, DB.XYZ(init_hx, init_hy, z),
                 )
-                # A single regenerate so the head box is available to measure.
+                # Establish the free-end leader (anchored at the element) BEFORE
+                # measuring. Some tag types (e.g. Assembly Tags) render the head
+                # at the element's own location until a leader exists, so the
+                # box must be measured with the leader in place to reflect where
+                # the head will actually sit.
+                tag.TagHeadPosition = DB.XYZ(init_hx, init_hy, z)
+                has_free = tag.CanLeaderEndConditionBeAssigned(
+                    DB.LeaderEndCondition.Free)
+                if has_free:
+                    tag.HasLeader = True
+                    tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+                    tag.SetLeaderEnd(ref, DB.XYZ(cx, cy, z))
+                doc.Regenerate()
+
+                # Measure the head-only box (leader line excluded) and record
+                # its extents relative to the head position. The box translates
+                # rigidly with the head, so candidates are evaluated purely
+                # geometrically with no further regeneration.
+                tag.HasLeader = False
                 doc.Regenerate()
                 bb = tag.get_BoundingBox(view)
+                tag.HasLeader = True
+                doc.Regenerate()
 
-                # Record the head box extents relative to the head position.
-                # The box translates rigidly with the head, so we can evaluate
-                # every candidate position with pure geometry (no regenerate).
                 dxmin = bb.Min.X - init_hx
                 dymin = bb.Min.Y - init_hy
                 dxmax = bb.Max.X - init_hx
@@ -337,12 +352,9 @@ def tag_hangers_no_overlap(
                     chosen = best_chosen
 
                 cand_box, leader_end = chosen
-                # Apply the chosen head position and a free-end leader once.
+                # The free-end leader is already anchored at the element; just
+                # move the head to the chosen position.
                 tag.TagHeadPosition = DB.XYZ(leader_end[0], leader_end[1], z)
-                if tag.CanLeaderEndConditionBeAssigned(DB.LeaderEndCondition.Free):
-                    tag.HasLeader = True
-                    tag.LeaderEndCondition = DB.LeaderEndCondition.Free
-                    tag.SetLeaderEnd(ref, DB.XYZ(cx, cy, z))
                 doc.Regenerate()
 
                 placed.append({
