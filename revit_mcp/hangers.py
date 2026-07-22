@@ -395,6 +395,30 @@ def tag_hangers_no_overlap(
         return {"status": "error", "message": "Failed to tag hangers: {}".format(str(e))}
 
 
+# Category / tag-family defaults for tagging spools (fabrication assemblies).
+SPOOL_CATEGORY = "Assemblies"
+SPOOL_TAG_CATEGORY = "Assembly Tags"
+
+
+def tag_spools(doc, view_name=None, retag_existing=False):
+    """Tag every spool (fabrication Assembly) in a view with the same
+    no-overlap / no-crossing / no-leader-through-text rules as the hanger
+    tool. Tag heads avoid piping, insulation and hangers.
+    """
+    return tag_hangers_no_overlap(
+        doc,
+        view_name=view_name,
+        hanger_category=SPOOL_CATEGORY,
+        tag_family_category=SPOOL_TAG_CATEGORY,
+        avoid_categories=[
+            "MEP Fabrication Pipework",
+            "Insulation",
+            "MEP Fabrication Hangers",
+        ],
+        retag_existing=retag_existing,
+    )
+
+
 def register_hanger_routes(api):
     """Register hanger-tagging routes with the API"""
     from pyrevit import routes
