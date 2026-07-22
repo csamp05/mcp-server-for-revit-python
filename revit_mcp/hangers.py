@@ -28,7 +28,15 @@ DEFAULT_RADII = [
     1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0,
     8.0, 10.0, 13.0, 16.0, 20.0, 25.0, 30.0,
 ]
-DEFAULT_ANGLES_DEG = [90, 45, 135, 0, 180, 315, 225, 270]
+# 16 directions (every 22.5 deg), tried from the shortest radius outward.
+# Ordered by preference: straight up/down and sideways first, then the
+# diagonals, so tags favour clean orthogonal leaders before angled ones.
+DEFAULT_ANGLES_DEG = [
+    90, 270, 0, 180,          # up, down, right, left
+    45, 135, 315, 225,        # 45-deg diagonals
+    68, 112, 292, 248,        # near-vertical
+    23, 157, 337, 203,        # near-horizontal
+]
 
 
 def _box_of(bb):
@@ -57,12 +65,36 @@ def _seg_intersect(p1, p2, p3, p4):
     )
 
 
+def _seg_intersects_box(p1, p2, box):
+    """True if segment p1->p2 crosses or lies inside the axis-aligned box."""
+    minx, miny, maxx, maxy = box
+    # Quick reject if the segment's bounding box misses the box entirely.
+    if (max(p1[0], p2[0]) < minx or min(p1[0], p2[0]) > maxx
+            or max(p1[1], p2[1]) < miny or min(p1[1], p2[1]) > maxy):
+        return False
+    corners = [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]
+    for i in range(4):
+        if _seg_intersect(p1, p2, corners[i], corners[(i + 1) % 4]):
+            return True
+    # Segment fully inside the box (an endpoint inside implies intersection).
+    if minx <= p1[0] <= maxx and miny <= p1[1] <= maxy:
+        return True
+    return False
+
+
 def _candidate_ok(cand_box, leader_start, leader_end, placed, obstacles,
                   tag_margin, obstacle_margin):
     for p in placed:
         if _box_overlap(cand_box, p["box"], tag_margin):
             return False
+        # No two leaders may cross each other.
         if _seg_intersect(leader_start, leader_end, p["hanger_pt"], p["head_pt"]):
+            return False
+        # This leader must not run through an already-placed tag's text box,
+        # and no placed leader may run through this candidate's text box.
+        if _seg_intersects_box(leader_start, leader_end, p["box"]):
+            return False
+        if _seg_intersects_box(p["hanger_pt"], p["head_pt"], cand_box):
             return False
     for ob in obstacles:
         if _box_overlap(cand_box, ob, obstacle_margin):
