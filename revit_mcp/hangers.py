@@ -148,6 +148,170 @@ def _leader_routes(hx, hy, cx, cy, ebox):
     return [straight, route_v, route_h]
 
 
+def _cluster_2d(recs, dist):
+    """Greedily group records whose targets are within `dist` of the cluster."""
+    unassigned = list(recs)
+    clusters = []
+    while unassigned:
+        cluster = [unassigned.pop(0)]
+        changed = True
+        while changed:
+            changed = False
+            for r in unassigned[:]:
+                if any((r["cx"] - c["cx"]) ** 2 + (r["cy"] - c["cy"]) ** 2
+                       <= dist * dist for c in cluster):
+                    cluster.append(r)
+                    unassigned.remove(r)
+                    changed = True
+        clusters.append(cluster)
+    return clusters
+
+
+def _run_clusters(hangers, x_gap):
+    """Group targets into runs separated by horizontal gaps wider than x_gap."""
+    ts = sorted(hangers, key=lambda t: t[1])
+    runs = []
+    cur = [ts[0]]
+    for t in ts[1:]:
+        if t[1] - cur[-1][1] > x_gap:
+            runs.append(cur)
+            cur = [t]
+        else:
+            cur.append(t)
+    runs.append(cur)
+    return runs
+
+
+def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
+                        to_tag, tags_to_remove, tag_margin):
+    """Place tags in vertical columns flanking each run (the manual method).
+
+    Tags stack at a fixed X beside the pipe run, ordered top-to-bottom to match
+    their targets so the short inward leaders form a non-crossing fan. Big runs
+    are split across left and right columns; columns are pushed into clear
+    space off the obstacles.
+    """
+    tagged_ids = []
+    lengths = []
+    placed_boxes = []
+
+    t = DB.Transaction(doc, "Tag - Ganged Columns")
+    t.Start()
+    try:
+        for tid in tags_to_remove:
+            doc.Delete(tid)
+        if not tag_symbol.IsActive:
+            tag_symbol.Activate()
+            doc.Regenerate()
+
+        # Pass 1: create each tag, establish its leader, measure its head box.
+        recs = []
+        for el, cx, cy, z, ebox in to_tag:
+            ref = DB.Reference(el)
+            tag = DB.IndependentTag.Create(
+                doc, tag_symbol.Id, view.Id, ref, True,
+                DB.TagOrientation.Horizontal, DB.XYZ(cx, cy + 2.0, z))
+            has_free = tag.CanLeaderEndConditionBeAssigned(
+                DB.LeaderEndCondition.Free)
+            if has_free:
+                tag.HasLeader = True
+                tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+                tag.SetLeaderEnd(ref, DB.XYZ(cx, cy, z))
+            doc.Regenerate()
+            tag.HasLeader = False
+            doc.Regenerate()
+            bb = tag.get_BoundingBox(view)
+            tag.HasLeader = True
+            doc.Regenerate()
+            w = bb.Max.X - bb.Min.X
+            h = bb.Max.Y - bb.Min.Y
+            recs.append({"el": el, "cx": cx, "cy": cy, "z": z, "ebox": ebox,
+                         "tag": tag, "ref": ref, "has_free": has_free,
+                         "w": w, "h": h})
+
+        if not recs:
+            t.Commit()
+            return tagged_ids, lengths
+
+        row_h = max(r["h"] for r in recs) + 0.35   # consistent row spacing
+        clear0 = 2.0                                 # gap from cluster to stack
+
+        # Cluster targets into small LOCAL groups (nearby in both X and Y): a
+        # dense hanger location becomes a compact stack right beside it, rather
+        # than one giant full-height column with long fanned leaders.
+        clusters = _cluster_2d(recs, dist=6.0)
+
+        for cluster in clusters:
+            cminx = min(r["cx"] for r in cluster)
+            cmaxx = max(r["cx"] for r in cluster)
+            # Split the cluster's tags left/right of the local group by x, so
+            # each side's leaders stay short and the two fans don't tangle.
+            cluster.sort(key=lambda r: r["cx"])
+            mid = (len(cluster) + 1) // 2
+            sides = [(-1, cluster[:mid]), (1, cluster[mid:])]
+
+            for side, col in sides:
+                if not col:
+                    continue
+                # Order the stack by target Y (top first). Tie-break by X so
+                # targets at the same height fan to the column without their
+                # leaders swapping and crossing.
+                col.sort(key=lambda r: (-r["cy"], -side * r["cx"]))
+                n = len(col)
+                colw = max(r["w"] for r in col)
+                ymean = sum(r["cy"] for r in col) / n
+                y_top = ymean + (n - 1) * row_h / 2.0
+
+                # Offset the stack just clear of the local cluster; nudge out
+                # further only if it lands on an already-placed stack (which
+                # would tangle their leaders). Pipework is not avoided here so
+                # stacks stay close and leaders short.
+                clear = clear0
+                for _ in range(40):
+                    if side < 0:
+                        edge = cminx - clear
+                        head_x = edge - (colw / 2.0)
+                        col_box = (head_x - colw / 2.0, y_top - (n - 1) * row_h,
+                                   edge, y_top)
+                    else:
+                        edge = cmaxx + clear
+                        head_x = edge + (colw / 2.0)
+                        col_box = (edge, y_top - (n - 1) * row_h,
+                                   head_x + colw / 2.0, y_top)
+                    if not any(_box_overlap(col_box, pb, 0.2)
+                               for pb in placed_boxes):
+                        break
+                    clear += 1.0
+
+                # Anchor every leader in this stack on a common vertical line at
+                # the cluster edge, each at its own target's Y. Heads sit on
+                # another vertical line (head_x), stacked in the same Y order, so
+                # the leaders form a fan between two vertical lines and cannot
+                # cross one another.
+                edge_x = cminx if side < 0 else cmaxx
+                for i, r in enumerate(col):
+                    hy = y_top - i * row_h
+                    hx = head_x
+                    tag = r["tag"]
+                    ref = r["ref"]
+                    tag.TagHeadPosition = DB.XYZ(hx, hy, r["z"])
+                    ls = (edge_x, r["cy"])
+                    if r["has_free"]:
+                        tag.SetLeaderEnd(ref, DB.XYZ(ls[0], ls[1], r["z"]))
+                    hw = r["w"] / 2.0
+                    hh = r["h"] / 2.0
+                    placed_boxes.append((hx - hw, hy - hh, hx + hw, hy + hh))
+                    tagged_ids.append(r["el"].Id.IntegerValue)
+                    lengths.append(math.hypot(hx - ls[0], hy - ls[1]))
+
+        doc.Regenerate()
+        t.Commit()
+    except Exception:
+        t.RollBack()
+        raise
+    return tagged_ids, lengths
+
+
 def tag_hangers_no_overlap(
     doc,
     view_name=None,
@@ -160,6 +324,7 @@ def tag_hangers_no_overlap(
     radii=None,
     angles_deg=None,
     max_leader=None,
+    layout="radial",
 ):
     """
     Tag every element of `hanger_category` visible in a view with an
@@ -315,6 +480,34 @@ def tag_hangers_no_overlap(
                     already_tagged_ids.add(tid.IntegerValue)
                     if retag_existing:
                         tags_to_remove.append(tg.Id)
+
+        # Ganged-column layout: stack tags in vertical columns beside each run.
+        if layout == "ganged":
+            to_tag = [h for h in hangers
+                      if retag_existing
+                      or h[0].Id.IntegerValue not in already_tagged_ids]
+            skipped_ids = [h[0].Id.IntegerValue for h in hangers
+                           if not retag_existing
+                           and h[0].Id.IntegerValue in already_tagged_ids]
+            g_tagged, g_lengths = _tag_ganged_columns(
+                doc, view, tag_symbol, hangers, obstacle_boxes,
+                to_tag, tags_to_remove, tag_margin)
+            result = {
+                "status": "success",
+                "view": view.Name,
+                "hanger_category": hanger_category,
+                "tagged_count": len(g_tagged),
+                "skipped_already_tagged": skipped_ids,
+                "could_not_clear": [],
+                "layout": "ganged",
+            }
+            if g_lengths:
+                result["leader_length_ft"] = {
+                    "min": round(min(g_lengths), 2),
+                    "max": round(max(g_lengths), 2),
+                    "avg": round(sum(g_lengths) / len(g_lengths), 2),
+                }
+            return result
 
         placed = []
         tagged_ids = []
@@ -479,24 +672,29 @@ SPOOL_TAG_CATEGORY = "Assembly Tags"
 SPOOL_MAX_LEADER = "auto"
 
 
+# Wider tag-to-tag clearance for spools so labels spread out rather than
+# stacking tightly.
+SPOOL_TAG_MARGIN = 0.8
+
+
 def tag_spools(doc, view_name=None, retag_existing=False):
     """Tag every spool (fabrication Assembly) in a view with the same
     no-overlap / no-crossing / no-leader-through-text rules as the hanger
-    tool. Tag heads prefer to avoid piping, insulation and hangers; the
-    leader-length cap scales automatically with how many spools are present.
+    tool. Tag heads avoid piping, insulation and hangers and are spaced out;
+    the leader-length cap scales automatically with how many spools there are.
     """
     return tag_hangers_no_overlap(
         doc,
         view_name=view_name,
         hanger_category=SPOOL_CATEGORY,
         tag_family_category=SPOOL_TAG_CATEGORY,
-        # A spool tag labels the pipe assembly it sits on, so it need not avoid
-        # pipework. Only the tag-vs-tag rules apply (no overlap, no crossing,
-        # no leader through another tag's text), which keeps leaders short and
-        # crossings minimal in dense spool views.
-        avoid_categories=[],
+        avoid_categories=[
+            "MEP Fabrication Pipework",
+            "Insulation",
+            "MEP Fabrication Hangers",
+        ],
         retag_existing=retag_existing,
-        max_leader=SPOOL_MAX_LEADER,
+        layout="ganged",
     )
 
 
