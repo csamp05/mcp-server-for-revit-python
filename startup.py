@@ -45,6 +45,10 @@ def register_routes():
 
         register_document_routes(api)
 
+        from revit_mcp.hangers import register_hanger_routes
+
+        register_hanger_routes(api)
+
         logger.info("All MCP routes registered successfully")
 
     except Exception as e:
