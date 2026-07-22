@@ -7,6 +7,18 @@ other, leader tails from crossing, and tags off of piping/insulation.
 Hangers that already have a tag in this view are left alone.
 """
 
+import os
+import sys
+
+# The revit_mcp package lives at the extension root. When this button runs
+# under the CPython engine, that root is not on sys.path (unlike startup.py),
+# so add it: script.py -> pushbutton -> panel -> tab -> extension root.
+_ext_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+if _ext_root not in sys.path:
+    sys.path.append(_ext_root)
+
 from pyrevit import revit, script
 from revit_mcp.hangers import tag_hangers_no_overlap
 
