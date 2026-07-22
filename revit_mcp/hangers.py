@@ -166,6 +166,11 @@ def tag_hangers_no_overlap(
                     cy = (bbox.Min.Y + bbox.Max.Y) / 2.0
                     z = bbox.Max.Z
                     hangers.append((el, cx, cy, z))
+                    # Hangers are tag targets, but if the category is also in
+                    # the avoid list, treat every hanger box as an obstacle so
+                    # tag heads never sit on top of any hanger (own or others).
+                    if cat in avoid_set:
+                        obstacle_boxes.append(_box_of(bbox))
             elif cat in avoid_set:
                 bbox = el.get_BoundingBox(view)
                 if bbox:
