@@ -10,7 +10,12 @@ import json
 import logging
 import math
 
-from pyrevit import routes, DB
+# NOTE: Only import DB here. `pyrevit.routes` must NOT be imported at module
+# level: it instantiates a .NET HTTP handler interface that fails under the
+# CPython engine ("interface takes exactly one argument"), which would break
+# the ribbon button. `routes` is imported lazily inside register_hanger_routes,
+# which only ever runs under IronPython at extension startup.
+from pyrevit import DB
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +316,7 @@ def tag_hangers_no_overlap(
 
 def register_hanger_routes(api):
     """Register hanger-tagging routes with the API"""
+    from pyrevit import routes
 
     @api.route("/tag_hangers/", methods=["POST"])
     def tag_hangers_route(doc, request):
