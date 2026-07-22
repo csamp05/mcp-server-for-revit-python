@@ -98,23 +98,54 @@ _PEN_OBSTACLE = 45.0
 _PEN_LEADER_THRU_TEXT = 25.0
 
 
-def _candidate_penalty(cand_box, leader_start, leader_end, placed, obstacles,
+def _segments(pts):
+    """Consecutive segments of a polyline given as a list of points."""
+    return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+
+
+def _candidate_penalty(cand_box, leader_pts, placed, obstacles,
                        tag_margin, obstacle_margin):
-    """Return a penalty score for a candidate position; 0.0 means fully clear."""
+    """Return a penalty score for a candidate position; 0.0 means fully clear.
+
+    `leader_pts` is the leader polyline (2 points for a straight leader, 3 for
+    an elbow). Every placed tag stores its own leader polyline in p["leader"].
+    """
     pen = 0.0
+    my_segs = _segments(leader_pts)
     for p in placed:
         if _box_overlap(cand_box, p["box"], tag_margin):
             pen += _PEN_TAG_OVERLAP
-        if _seg_intersect(leader_start, leader_end, p["hanger_pt"], p["head_pt"]):
-            pen += _PEN_LEADER_CROSS
-        if _seg_intersects_box(leader_start, leader_end, p["box"]):
-            pen += _PEN_LEADER_THRU_TEXT
-        if _seg_intersects_box(p["hanger_pt"], p["head_pt"], cand_box):
-            pen += _PEN_LEADER_THRU_TEXT
+        p_segs = _segments(p["leader"])
+        for a1, a2 in my_segs:
+            for b1, b2 in p_segs:
+                if _seg_intersect(a1, a2, b1, b2):
+                    pen += _PEN_LEADER_CROSS
+            if _seg_intersects_box(a1, a2, p["box"]):
+                pen += _PEN_LEADER_THRU_TEXT
+        for b1, b2 in p_segs:
+            if _seg_intersects_box(b1, b2, cand_box):
+                pen += _PEN_LEADER_THRU_TEXT
     for ob in obstacles:
         if _box_overlap(cand_box, ob, obstacle_margin):
             pen += _PEN_OBSTACLE
     return pen
+
+
+def _leader_routes(hx, hy, cx, cy, ebox):
+    """Candidate leader polylines from the target to head (hx, hy).
+
+    Straight first (shortest), then two L-shaped detours (vertical-then-
+    horizontal and horizontal-then-vertical) whose elbow lets the leader
+    route around obstacles such as other tags' text.
+    """
+    straight = [_nearest_on_box(hx, hy, ebox), (hx, hy)]
+    # Elbow at (hx, cy): leader runs from the target out to x=hx then up to head.
+    elbow_v = (hx, cy)
+    route_v = [_nearest_on_box(elbow_v[0], elbow_v[1], ebox), elbow_v, (hx, hy)]
+    # Elbow at (cx, hy): leader runs from the target across to y=hy then to head.
+    elbow_h = (cx, hy)
+    route_h = [_nearest_on_box(elbow_h[0], elbow_h[1], ebox), elbow_h, (hx, hy)]
+    return [straight, route_v, route_h]
 
 
 def tag_hangers_no_overlap(
@@ -352,24 +383,26 @@ def tag_hangers_no_overlap(
                         hx = cx + radius * math.cos(rad)
                         hy = cy + radius * math.sin(rad)
                         cand_box = (hx + dxmin, hy + dymin, hx + dxmax, hy + dymax)
-                        leader_end = (hx, hy)
-                        # Attach the leader at the point on the element nearest
-                        # the head, not the centre. For extended targets (spools)
-                        # this yields short edge leaders that rarely cross.
-                        leader_start = _nearest_on_box(hx, hy, ebox)
-                        pen = _candidate_penalty(
-                            cand_box, leader_start, leader_end, placed,
-                            obstacle_boxes, tag_margin, obstacle_margin,
-                        )
-                        if pen == 0.0:
-                            chosen = (cand_box, leader_end, leader_start)
-                            placed_ok = True
+                        # Try a straight leader first, then elbow detours; the
+                        # elbow lets the leader route around other tags' text.
+                        for ri, route in enumerate(
+                                _leader_routes(hx, hy, cx, cy, ebox)):
+                            pen = _candidate_penalty(
+                                cand_box, route, placed,
+                                obstacle_boxes, tag_margin, obstacle_margin,
+                            )
+                            if pen == 0.0:
+                                chosen = (cand_box, route)
+                                placed_ok = True
+                                break
+                            # Prefer low penalty, then short leader, then a
+                            # straight leader over an elbow (ri tiebreak).
+                            score = pen + radius * 0.01 + ri * 0.001
+                            if best_score is None or score < best_score:
+                                best_score = score
+                                best_chosen = (cand_box, route)
+                        if placed_ok:
                             break
-                        # Prefer lower penalty, then shorter leader (radius).
-                        score = pen + radius * 0.001
-                        if best_score is None or score < best_score:
-                            best_score = score
-                            best_chosen = (cand_box, leader_end, leader_start)
                     if placed_ok:
                         break
 
@@ -379,24 +412,33 @@ def tag_hangers_no_overlap(
                     # to a fixed position that may overlap several neighbours.
                     chosen = best_chosen
 
-                cand_box, leader_end, leader_start = chosen
-                # Move the head to the chosen position and anchor the free-end
-                # leader at the nearest point on the element.
+                cand_box, route = chosen
+                leader_start = route[0]
+                leader_end = route[-1]
+                elbow = route[1] if len(route) == 3 else None
+                # Move the head, anchor the free-end leader at the element, and
+                # add the elbow if the chosen route bends.
                 tag.TagHeadPosition = DB.XYZ(leader_end[0], leader_end[1], z)
                 if has_free:
                     tag.SetLeaderEnd(ref, DB.XYZ(leader_start[0], leader_start[1], z))
+                    if elbow is not None:
+                        try:
+                            tag.SetLeaderElbow(ref, DB.XYZ(elbow[0], elbow[1], z))
+                        except Exception:
+                            pass
                 doc.Regenerate()
 
                 placed.append({
                     "id": tag.Id.IntegerValue, "box": cand_box,
-                    "hanger_pt": leader_start, "head_pt": leader_end,
+                    "leader": route,
                 })
                 if placed_ok:
                     tagged_ids.append(el.Id.IntegerValue)
-                    lengths.append(math.hypot(
-                        leader_end[0] - leader_start[0],
-                        leader_end[1] - leader_start[1]
-                    ))
+                    seglen = sum(
+                        math.hypot(route[k + 1][0] - route[k][0],
+                                   route[k + 1][1] - route[k][1])
+                        for k in range(len(route) - 1))
+                    lengths.append(seglen)
                 else:
                     failed_ids.append(el.Id.IntegerValue)
 
