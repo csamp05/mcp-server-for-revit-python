@@ -14,7 +14,11 @@ from pyrevit import routes, DB
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_AVOID_CATEGORIES = ["MEP Fabrication Pipework", "Insulation"]
+DEFAULT_AVOID_CATEGORIES = [
+    "MEP Fabrication Pipework",
+    "Insulation",
+    "MEP Fabrication Hangers",
+]
 DEFAULT_RADII = [
     1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0,
     8.0, 10.0, 13.0, 16.0, 20.0, 25.0, 30.0,
