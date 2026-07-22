@@ -65,6 +65,14 @@ def _seg_intersect(p1, p2, p3, p4):
     )
 
 
+def _nearest_on_box(px, py, box):
+    """Closest point to (px, py) on/inside the axis-aligned box."""
+    minx, miny, maxx, maxy = box
+    nx = min(max(px, minx), maxx)
+    ny = min(max(py, miny), maxy)
+    return (nx, ny)
+
+
 def _seg_intersects_box(p1, p2, box):
     """True if segment p1->p2 crosses or lies inside the axis-aligned box."""
     minx, miny, maxx, maxy = box
@@ -171,11 +179,8 @@ def tag_hangers_no_overlap(
             avoid_categories = DEFAULT_AVOID_CATEGORIES
         radii = radii or DEFAULT_RADII
         angles_deg = angles_deg or DEFAULT_ANGLES_DEG
-        # Cap leader length: don't try positions farther than max_leader. Tags
-        # that can't find a clear spot within the cap take the least-bad short
-        # spot instead of shooting far out to clear an obstacle.
-        if max_leader is not None:
-            radii = [r for r in radii if r <= max_leader] or [radii[0]]
+        # Leader cap is applied after the targets are collected (below), because
+        # "auto" needs to know how many there are.
 
         tag_symbol = None
         for s in DB.FilteredElementCollector(doc).OfClass(DB.FamilySymbol):
@@ -210,7 +215,10 @@ def tag_hangers_no_overlap(
                     cx = (bbox.Min.X + bbox.Max.X) / 2.0
                     cy = (bbox.Min.Y + bbox.Max.Y) / 2.0
                     z = bbox.Max.Z
-                    hangers.append((el, cx, cy, z))
+                    # Keep the element's plan box: the leader may attach to the
+                    # nearest point on it (not just the centre), which matters
+                    # for extended targets like spools.
+                    hangers.append((el, cx, cy, z, _box_of(bbox)))
                     # Hangers are tag targets, but if the category is also in
                     # the avoid list, treat every hanger box as an obstacle so
                     # tag heads never sit on top of any hanger (own or others).
@@ -247,6 +255,17 @@ def tag_hangers_no_overlap(
 
         hangers.sort(key=lambda r: (-_crowd(r), r[1], r[2]))
 
+        # Apply the leader-length cap now that the target count is known.
+        # "auto" scales the cap with sqrt(count): to pack N tags without
+        # overlap they need an area ~ N, so the reach they require grows like
+        # sqrt(N). Sparse views stay tight; dense views get room to spread.
+        if max_leader == "auto":
+            eff_cap = max(6.0, 1.3 * math.sqrt(len(hangers)))
+        else:
+            eff_cap = max_leader
+        if eff_cap is not None:
+            radii = [r for r in radii if r <= eff_cap] or [radii[0]]
+
         existing_tags = DB.FilteredElementCollector(doc, view.Id).OfClass(DB.IndependentTag)
         already_tagged_ids = set()
         tags_to_remove = []
@@ -282,7 +301,7 @@ def tag_hangers_no_overlap(
                 tag_symbol.Activate()
                 doc.Regenerate()
 
-            for el, cx, cy, z in hangers:
+            for el, cx, cy, z, ebox in hangers:
                 if el.Id.IntegerValue in already_tagged_ids and not retag_existing:
                     skipped_ids.append(el.Id.IntegerValue)
                     continue
@@ -322,7 +341,6 @@ def tag_hangers_no_overlap(
                 dxmax = bb.Max.X - init_hx
                 dymax = bb.Max.Y - init_hy
 
-                leader_start = (cx, cy)
                 placed_ok = False
                 chosen = None
                 # Track the least-bad candidate in case none is fully clear.
@@ -335,19 +353,23 @@ def tag_hangers_no_overlap(
                         hy = cy + radius * math.sin(rad)
                         cand_box = (hx + dxmin, hy + dymin, hx + dxmax, hy + dymax)
                         leader_end = (hx, hy)
+                        # Attach the leader at the point on the element nearest
+                        # the head, not the centre. For extended targets (spools)
+                        # this yields short edge leaders that rarely cross.
+                        leader_start = _nearest_on_box(hx, hy, ebox)
                         pen = _candidate_penalty(
                             cand_box, leader_start, leader_end, placed,
                             obstacle_boxes, tag_margin, obstacle_margin,
                         )
                         if pen == 0.0:
-                            chosen = (cand_box, leader_end)
+                            chosen = (cand_box, leader_end, leader_start)
                             placed_ok = True
                             break
                         # Prefer lower penalty, then shorter leader (radius).
                         score = pen + radius * 0.001
                         if best_score is None or score < best_score:
                             best_score = score
-                            best_chosen = (cand_box, leader_end)
+                            best_chosen = (cand_box, leader_end, leader_start)
                     if placed_ok:
                         break
 
@@ -357,10 +379,12 @@ def tag_hangers_no_overlap(
                     # to a fixed position that may overlap several neighbours.
                     chosen = best_chosen
 
-                cand_box, leader_end = chosen
-                # The free-end leader is already anchored at the element; just
-                # move the head to the chosen position.
+                cand_box, leader_end, leader_start = chosen
+                # Move the head to the chosen position and anchor the free-end
+                # leader at the nearest point on the element.
                 tag.TagHeadPosition = DB.XYZ(leader_end[0], leader_end[1], z)
+                if has_free:
+                    tag.SetLeaderEnd(ref, DB.XYZ(leader_start[0], leader_start[1], z))
                 doc.Regenerate()
 
                 placed.append({
@@ -370,7 +394,8 @@ def tag_hangers_no_overlap(
                 if placed_ok:
                     tagged_ids.append(el.Id.IntegerValue)
                     lengths.append(math.hypot(
-                        leader_end[0] - cx, leader_end[1] - cy
+                        leader_end[0] - leader_start[0],
+                        leader_end[1] - leader_start[1]
                     ))
                 else:
                     failed_ids.append(el.Id.IntegerValue)
@@ -406,28 +431,28 @@ SPOOL_CATEGORY = "Assemblies"
 SPOOL_TAG_CATEGORY = "Assembly Tags"
 
 
-# Spools sit inside dense pipework, so cap the leader length: a tag prefers a
-# clear spot within this distance, otherwise it takes a short spot (possibly
-# over a pipe) rather than shooting far out.
-SPOOL_MAX_LEADER = 6.0
+# Spools sit inside dense pipework, so cap the leader length. "auto" scales
+# the cap with the spool count: a sparse view keeps leaders tight (~6 ft),
+# while a dense view lets them reach out far enough to spread apart.
+SPOOL_MAX_LEADER = "auto"
 
 
 def tag_spools(doc, view_name=None, retag_existing=False):
     """Tag every spool (fabrication Assembly) in a view with the same
     no-overlap / no-crossing / no-leader-through-text rules as the hanger
-    tool. Tag heads prefer to avoid piping, insulation and hangers, but
-    leader length is capped so tags stay close to their spool.
+    tool. Tag heads prefer to avoid piping, insulation and hangers; the
+    leader-length cap scales automatically with how many spools are present.
     """
     return tag_hangers_no_overlap(
         doc,
         view_name=view_name,
         hanger_category=SPOOL_CATEGORY,
         tag_family_category=SPOOL_TAG_CATEGORY,
-        avoid_categories=[
-            "MEP Fabrication Pipework",
-            "Insulation",
-            "MEP Fabrication Hangers",
-        ],
+        # A spool tag labels the pipe assembly it sits on, so it need not avoid
+        # pipework. Only the tag-vs-tag rules apply (no overlap, no crossing,
+        # no leader through another tag's text), which keeps leaders short and
+        # crossings minimal in dense spool views.
+        avoid_categories=[],
         retag_existing=retag_existing,
         max_leader=SPOOL_MAX_LEADER,
     )
