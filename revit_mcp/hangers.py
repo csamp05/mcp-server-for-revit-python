@@ -120,6 +120,7 @@ def tag_hangers_no_overlap(
     obstacle_margin=0.15,
     radii=None,
     angles_deg=None,
+    max_leader=None,
 ):
     """
     Tag every element of `hanger_category` visible in a view with an
@@ -170,6 +171,11 @@ def tag_hangers_no_overlap(
             avoid_categories = DEFAULT_AVOID_CATEGORIES
         radii = radii or DEFAULT_RADII
         angles_deg = angles_deg or DEFAULT_ANGLES_DEG
+        # Cap leader length: don't try positions farther than max_leader. Tags
+        # that can't find a clear spot within the cap take the least-bad short
+        # spot instead of shooting far out to clear an obstacle.
+        if max_leader is not None:
+            radii = [r for r in radii if r <= max_leader] or [radii[0]]
 
         tag_symbol = None
         for s in DB.FilteredElementCollector(doc).OfClass(DB.FamilySymbol):
@@ -400,10 +406,17 @@ SPOOL_CATEGORY = "Assemblies"
 SPOOL_TAG_CATEGORY = "Assembly Tags"
 
 
+# Spools sit inside dense pipework, so cap the leader length: a tag prefers a
+# clear spot within this distance, otherwise it takes a short spot (possibly
+# over a pipe) rather than shooting far out.
+SPOOL_MAX_LEADER = 6.0
+
+
 def tag_spools(doc, view_name=None, retag_existing=False):
     """Tag every spool (fabrication Assembly) in a view with the same
     no-overlap / no-crossing / no-leader-through-text rules as the hanger
-    tool. Tag heads avoid piping, insulation and hangers.
+    tool. Tag heads prefer to avoid piping, insulation and hangers, but
+    leader length is capped so tags stay close to their spool.
     """
     return tag_hangers_no_overlap(
         doc,
@@ -416,6 +429,7 @@ def tag_spools(doc, view_name=None, retag_existing=False):
             "MEP Fabrication Hangers",
         ],
         retag_existing=retag_existing,
+        max_leader=SPOOL_MAX_LEADER,
     )
 
 
