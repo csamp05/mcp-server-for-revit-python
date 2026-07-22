@@ -82,24 +82,31 @@ def _seg_intersects_box(p1, p2, box):
     return False
 
 
-def _candidate_ok(cand_box, leader_start, leader_end, placed, obstacles,
-                  tag_margin, obstacle_margin):
+# Penalty weights for scoring a candidate position (higher = worse). Used to
+# pick the least-bad spot when no fully clear position exists.
+_PEN_TAG_OVERLAP = 100.0
+_PEN_LEADER_CROSS = 60.0
+_PEN_OBSTACLE = 45.0
+_PEN_LEADER_THRU_TEXT = 25.0
+
+
+def _candidate_penalty(cand_box, leader_start, leader_end, placed, obstacles,
+                       tag_margin, obstacle_margin):
+    """Return a penalty score for a candidate position; 0.0 means fully clear."""
+    pen = 0.0
     for p in placed:
         if _box_overlap(cand_box, p["box"], tag_margin):
-            return False
-        # No two leaders may cross each other.
+            pen += _PEN_TAG_OVERLAP
         if _seg_intersect(leader_start, leader_end, p["hanger_pt"], p["head_pt"]):
-            return False
-        # This leader must not run through an already-placed tag's text box,
-        # and no placed leader may run through this candidate's text box.
+            pen += _PEN_LEADER_CROSS
         if _seg_intersects_box(leader_start, leader_end, p["box"]):
-            return False
+            pen += _PEN_LEADER_THRU_TEXT
         if _seg_intersects_box(p["hanger_pt"], p["head_pt"], cand_box):
-            return False
+            pen += _PEN_LEADER_THRU_TEXT
     for ob in obstacles:
         if _box_overlap(cand_box, ob, obstacle_margin):
-            return False
-    return True
+            pen += _PEN_OBSTACLE
+    return pen
 
 
 def tag_hangers_no_overlap(
@@ -216,7 +223,23 @@ def tag_hangers_no_overlap(
                 ),
             }
 
-        hangers.sort(key=lambda r: (r[1], r[2]))
+        # Place the most crowded hangers first: while the field is still empty
+        # they can claim the few clear spots, leaving the roomier hangers to
+        # adapt around them. Crowdedness = number of other hangers nearby.
+        NEIGHBOR_R = 8.0
+        NEIGHBOR_R2 = NEIGHBOR_R * NEIGHBOR_R
+
+        def _crowd(r):
+            cx, cy = r[1], r[2]
+            n = 0
+            for o in hangers:
+                if o is r:
+                    continue
+                if (o[1] - cx) ** 2 + (o[2] - cy) ** 2 <= NEIGHBOR_R2:
+                    n += 1
+            return n
+
+        hangers.sort(key=lambda r: (-_crowd(r), r[1], r[2]))
 
         existing_tags = DB.FilteredElementCollector(doc, view.Id).OfClass(DB.IndependentTag)
         already_tagged_ids = set()
@@ -281,6 +304,9 @@ def tag_hangers_no_overlap(
                 leader_start = (cx, cy)
                 placed_ok = False
                 chosen = None
+                # Track the least-bad candidate in case none is fully clear.
+                best_score = None
+                best_chosen = None
                 for radius in radii:
                     for ang in angles_deg:
                         rad = math.radians(ang)
@@ -288,21 +314,27 @@ def tag_hangers_no_overlap(
                         hy = cy + radius * math.sin(rad)
                         cand_box = (hx + dxmin, hy + dymin, hx + dxmax, hy + dymax)
                         leader_end = (hx, hy)
-                        if _candidate_ok(
+                        pen = _candidate_penalty(
                             cand_box, leader_start, leader_end, placed,
                             obstacle_boxes, tag_margin, obstacle_margin,
-                        ):
+                        )
+                        if pen == 0.0:
                             chosen = (cand_box, leader_end)
                             placed_ok = True
                             break
+                        # Prefer lower penalty, then shorter leader (radius).
+                        score = pen + radius * 0.001
+                        if best_score is None or score < best_score:
+                            best_score = score
+                            best_chosen = (cand_box, leader_end)
                     if placed_ok:
                         break
 
                 if not placed_ok:
-                    # Fall back to the last (farthest) candidate tried.
-                    cand_box = (init_hx + dxmin, init_hy + dymin,
-                                init_hx + dxmax, init_hy + dymax)
-                    chosen = (cand_box, (init_hx, init_hy))
+                    # No fully clear spot: take the least-bad candidate so the
+                    # unavoidable compromise is minimal instead of defaulting
+                    # to a fixed position that may overlap several neighbours.
+                    chosen = best_chosen
 
                 cand_box, leader_end = chosen
                 # Apply the chosen head position and a free-end leader once.
