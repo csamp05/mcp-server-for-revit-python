@@ -48,18 +48,8 @@ def _seg_intersect(p1, p2, p3, p4):
     )
 
 
-def _head_only_box(doc, tag, view):
-    """Bounding box of just the tag head, excluding the leader line."""
-    tag.HasLeader = False
-    doc.Regenerate()
-    bb = tag.get_BoundingBox(view)
-    tag.HasLeader = True
-    doc.Regenerate()
-    return _box_of(bb)
-
-
 def _candidate_ok(cand_box, leader_start, leader_end, placed, obstacles,
-                   tag_margin, obstacle_margin):
+                  tag_margin, obstacle_margin):
     for p in placed:
         if _box_overlap(cand_box, p["box"], tag_margin):
             return False
@@ -223,12 +213,26 @@ def tag_hangers_no_overlap(
                     continue
 
                 ref = DB.Reference(el)
+                # Create the tag WITHOUT a leader so its bounding box is the
+                # head only. Position it a default distance up to start.
+                init_hx, init_hy = cx, cy + radii[0]
                 tag = DB.IndependentTag.Create(
-                    doc, tag_symbol.Id, view.Id, ref, True,
-                    DB.TagOrientation.Horizontal, DB.XYZ(cx, cy + radii[0], z),
+                    doc, tag_symbol.Id, view.Id, ref, False,
+                    DB.TagOrientation.Horizontal, DB.XYZ(init_hx, init_hy, z),
                 )
+                # A single regenerate so the head box is available to measure.
                 doc.Regenerate()
+                bb = tag.get_BoundingBox(view)
 
+                # Record the head box extents relative to the head position.
+                # The box translates rigidly with the head, so we can evaluate
+                # every candidate position with pure geometry (no regenerate).
+                dxmin = bb.Min.X - init_hx
+                dymin = bb.Min.Y - init_hy
+                dxmax = bb.Max.X - init_hx
+                dymax = bb.Max.Y - init_hy
+
+                leader_start = (cx, cy)
                 placed_ok = False
                 chosen = None
                 for radius in radii:
@@ -236,43 +240,43 @@ def tag_hangers_no_overlap(
                         rad = math.radians(ang)
                         hx = cx + radius * math.cos(rad)
                         hy = cy + radius * math.sin(rad)
-                        tag.TagHeadPosition = DB.XYZ(hx, hy, z)
-                        doc.Regenerate()
-                        cand_box = _head_only_box(doc, tag, view)
-                        leader_start = (cx, cy)
+                        cand_box = (hx + dxmin, hy + dymin, hx + dxmax, hy + dymax)
                         leader_end = (hx, hy)
                         if _candidate_ok(
                             cand_box, leader_start, leader_end, placed,
                             obstacle_boxes, tag_margin, obstacle_margin,
                         ):
-                            chosen = (cand_box, leader_start, leader_end)
+                            chosen = (cand_box, leader_end)
                             placed_ok = True
                             break
                     if placed_ok:
                         break
 
+                if not placed_ok:
+                    # Fall back to the last (farthest) candidate tried.
+                    cand_box = (init_hx + dxmin, init_hy + dymin,
+                                init_hx + dxmax, init_hy + dymax)
+                    chosen = (cand_box, (init_hx, init_hy))
+
+                cand_box, leader_end = chosen
+                # Apply the chosen head position and a free-end leader once.
+                tag.TagHeadPosition = DB.XYZ(leader_end[0], leader_end[1], z)
+                if tag.CanLeaderEndConditionBeAssigned(DB.LeaderEndCondition.Free):
+                    tag.HasLeader = True
+                    tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+                    tag.SetLeaderEnd(ref, DB.XYZ(cx, cy, z))
+                doc.Regenerate()
+
+                placed.append({
+                    "id": tag.Id.IntegerValue, "box": cand_box,
+                    "hanger_pt": leader_start, "head_pt": leader_end,
+                })
                 if placed_ok:
-                    cand_box, leader_start, leader_end = chosen
-                    if tag.CanLeaderEndConditionBeAssigned(DB.LeaderEndCondition.Free):
-                        tag.LeaderEndCondition = DB.LeaderEndCondition.Free
-                        doc.Regenerate()
-                        tag.SetLeaderEnd(ref, DB.XYZ(leader_start[0], leader_start[1], z))
-                        doc.Regenerate()
-                    placed.append({
-                        "id": tag.Id.IntegerValue, "box": cand_box,
-                        "hanger_pt": leader_start, "head_pt": leader_end,
-                    })
                     tagged_ids.append(el.Id.IntegerValue)
                     lengths.append(math.hypot(
-                        leader_end[0] - leader_start[0], leader_end[1] - leader_start[1]
+                        leader_end[0] - cx, leader_end[1] - cy
                     ))
                 else:
-                    cand_box = _head_only_box(doc, tag, view)
-                    placed.append({
-                        "id": tag.Id.IntegerValue, "box": cand_box,
-                        "hanger_pt": (cx, cy),
-                        "head_pt": (tag.TagHeadPosition.X, tag.TagHeadPosition.Y),
-                    })
                     failed_ids.append(el.Id.IntegerValue)
 
             t.Commit()
