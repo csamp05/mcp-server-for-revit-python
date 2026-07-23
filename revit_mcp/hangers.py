@@ -402,22 +402,103 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                     tagged_ids.append(r["el"].Id.IntegerValue)
                     lengths.append(math.hypot(hx - elbow[0], hy - elbow[1])
                                    + math.hypot(elbow[0] - tgt[0], elbow[1] - tgt[1]))
-                    # Record for the straight-leader pass below.
+                    # Record for the straight-leader / migration passes below.
                     placed_info.append({
                         "tag": tag, "ref": ref, "z": r["z"], "ebox": r["ebox"],
+                        "cx": r["cx"], "cy": r["cy"],
                         "head": (hx, hy), "elbow": elbow, "tgt": tgt, "box": box,
                         "straight": None,
                     })
 
-        # Straight-leader pass: replace a tag's shoulder elbow with a straight
-        # leader wherever the straight line stays clear of every other leader
-        # and text box. This gives the clean hand-drawn mix of straight and
-        # doglegged leaders without ever adding a crossing or through-text.
         def _cur_segs(info):
             if info["straight"] is not None:
                 return [info["straight"]]
             return [(info["tgt"], info["elbow"]),
                     (info["elbow"], info["head"])]
+
+        # Migration pass: a tag whose leader crosses another leader or clips
+        # another tag's text is almost always one the greedy clustering placed
+        # in a far column. Move it to the nearest column with a free row where a
+        # straight leader is clean. This removes the cross-cluster crossings and
+        # through-text that the per-column ordering can't reach (mirrors the
+        # manual "drag the outlier to a nearer column" fix).
+        def _is_bad(idx):
+            a_segs = _cur_segs(placed_info[idx])
+            for j, other in enumerate(placed_info):
+                if j == idx:
+                    continue
+                for s1 in a_segs:
+                    if _seg_intersects_box(s1[0], s1[1], other["box"]):
+                        return True
+                    for s2 in _cur_segs(other):
+                        if _seg_intersect(s1[0], s1[1], s2[0], s2[1]):
+                            return True
+            return False
+
+        col_xs = sorted(set(round(info["head"][0], 1) for info in placed_info))
+        for i, info in enumerate(placed_info):
+            if not _is_bad(i):
+                continue
+            cx, cy = info["cx"], info["cy"]
+            hw = (info["box"][2] - info["box"][0]) / 2.0
+            hh = (info["box"][3] - info["box"][1]) / 2.0
+            cur_len = sum(math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1])
+                          for s in _cur_segs(info))
+            best = None
+            for col_x in sorted(col_xs, key=lambda x: abs(x - cx)):
+                for k in range(0, 9):
+                    for sgn in ((1, -1) if k else (1,)):
+                        hy = cy + sgn * k * row_h
+                        nb = (col_x - hw, hy - hh, col_x + hw, hy + hh)
+                        if any(_box_overlap(nb, o["box"], tag_margin)
+                               for o in placed_info if o is not info):
+                            continue
+                        st = _nearest_on_box(col_x, hy, info["ebox"])
+                        ln = math.hypot(col_x - st[0], hy - st[1])
+                        if ln >= cur_len:
+                            continue
+                        sseg = (st, (col_x, hy))
+                        clean = True
+                        for o in placed_info:
+                            if o is info:
+                                continue
+                            if _seg_intersects_box(sseg[0], sseg[1], o["box"]):
+                                clean = False
+                                break
+                            for os in _cur_segs(o):
+                                if _seg_intersect(sseg[0], sseg[1], os[0], os[1]):
+                                    clean = False
+                                    break
+                            if not clean:
+                                break
+                        if clean and (best is None or ln < best[3]):
+                            best = (col_x, hy, st, ln, nb, sseg)
+                if best is not None:
+                    break   # nearest column that offers a clean spot wins
+            if best is not None:
+                col_x, hy, st, ln, nb, sseg = best
+                tag = info["tag"]
+                ref = info["ref"]
+                z = info["z"]
+                try:
+                    tag.TagHeadPosition = DB.XYZ(col_x, hy, z)
+                    tag.HasLeader = False
+                    doc.Regenerate()
+                    tag.HasLeader = True
+                    tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+                    tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+                    doc.Regenerate()
+                    info["head"] = (col_x, hy)
+                    info["box"] = nb
+                    info["tgt"] = st
+                    info["straight"] = sseg
+                except Exception:
+                    pass
+
+        # Straight-leader pass: replace a tag's shoulder elbow with a straight
+        # leader wherever the straight line stays clear of every other leader
+        # and text box. This gives the clean hand-drawn mix of straight and
+        # doglegged leaders without ever adding a crossing or through-text.
 
         for i, info in enumerate(placed_info):
             head = info["head"]
