@@ -148,6 +148,49 @@ def _leader_routes(hx, hy, cx, cy, ebox):
     return [straight, route_v, route_h]
 
 
+def _callout_regions(doc, view):
+    """Model-XY rectangles (minx, miny, maxx, maxy) of the callouts drawn on a
+    view. Elements inside a callout are detailed in the callout view, so the
+    parent view should not tag them."""
+    regions = []
+    ref_names = set()
+    for el in DB.FilteredElementCollector(doc, view.Id).WhereElementIsNotElementType():
+        try:
+            if el.Category and el.Category.Name == "Views":
+                p = el.get_Parameter(DB.BuiltInParameter.VIEW_NAME)
+                if p and p.AsString():
+                    ref_names.add(p.AsString())
+        except Exception:
+            pass
+    if not ref_names:
+        return regions
+    for vw in DB.FilteredElementCollector(doc).OfClass(DB.View):
+        try:
+            if vw.Name not in ref_names:
+                continue
+            cb = vw.CropBox
+            tr = cb.Transform
+            xs = []
+            ys = []
+            for xx in (cb.Min.X, cb.Max.X):
+                for yy in (cb.Min.Y, cb.Max.Y):
+                    for zz in (cb.Min.Z, cb.Max.Z):
+                        pt = tr.OfPoint(DB.XYZ(xx, yy, zz))
+                        xs.append(pt.X)
+                        ys.append(pt.Y)
+            regions.append((min(xs), min(ys), max(xs), max(ys)))
+        except Exception:
+            pass
+    return regions
+
+
+def _point_in_regions(px, py, regions):
+    for (minx, miny, maxx, maxy) in regions:
+        if minx <= px <= maxx and miny <= py <= maxy:
+            return True
+    return False
+
+
 def _cluster_2d(recs, dist):
     """Greedily group records whose targets are within `dist` of the cluster."""
     unassigned = list(recs)
@@ -206,6 +249,7 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
 
         # Pass 1: create each tag, establish its leader, measure its head box.
         recs = []
+        _last_wh = [4.5, 0.85]   # fallback size if a tag can't be measured
         for el, cx, cy, z, ebox in to_tag:
             ref = DB.Reference(el)
             tag = DB.IndependentTag.Create(
@@ -223,8 +267,14 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
             bb = tag.get_BoundingBox(view)
             tag.HasLeader = True
             doc.Regenerate()
-            w = bb.Max.X - bb.Min.X
-            h = bb.Max.Y - bb.Min.Y
+            if bb is not None:
+                w = bb.Max.X - bb.Min.X
+                h = bb.Max.Y - bb.Min.Y
+                _last_wh[0], _last_wh[1] = w, h
+            else:
+                # Tag fell outside the view crop (common on tight callout
+                # views); fall back to the last measured size.
+                w, h = _last_wh[0], _last_wh[1]
             recs.append({"el": el, "cx": cx, "cy": cy, "z": z, "ebox": ebox,
                          "tag": tag, "ref": ref, "has_free": has_free,
                          "w": w, "h": h})
@@ -373,6 +423,7 @@ def tag_hangers_no_overlap(
     angles_deg=None,
     max_leader=None,
     layout="radial",
+    exclude_callouts=True,
 ):
     """
     Tag every element of `hanger_category` visible in a view with an
@@ -445,6 +496,11 @@ def tag_hangers_no_overlap(
 
         collector = DB.FilteredElementCollector(doc, view.Id).WhereElementIsNotElementType()
 
+        # Callout regions on this view: their contents are detailed (and tagged)
+        # in the callout view, so skip any target whose centre falls inside one.
+        callout_regions = _callout_regions(doc, view) if exclude_callouts else []
+        in_callout_count = 0
+
         hangers = []
         obstacle_boxes = []
         avoid_set = set(avoid_categories)
@@ -459,6 +515,9 @@ def tag_hangers_no_overlap(
                     cx = (bbox.Min.X + bbox.Max.X) / 2.0
                     cy = (bbox.Min.Y + bbox.Max.Y) / 2.0
                     z = bbox.Max.Z
+                    if callout_regions and _point_in_regions(cx, cy, callout_regions):
+                        in_callout_count += 1
+                        continue
                     # Keep the element's plan box: the leader may attach to the
                     # nearest point on it (not just the centre), which matters
                     # for extended targets like spools.
@@ -547,6 +606,7 @@ def tag_hangers_no_overlap(
                 "tagged_count": len(g_tagged),
                 "skipped_already_tagged": skipped_ids,
                 "could_not_clear": [],
+                "excluded_in_callout": in_callout_count,
                 "layout": "ganged",
             }
             if g_lengths:
@@ -608,10 +668,15 @@ def tag_hangers_no_overlap(
                 tag.HasLeader = True
                 doc.Regenerate()
 
-                dxmin = bb.Min.X - init_hx
-                dymin = bb.Min.Y - init_hy
-                dxmax = bb.Max.X - init_hx
-                dymax = bb.Max.Y - init_hy
+                if bb is None:
+                    # Tag outside the view crop (e.g. tight callout view); use a
+                    # nominal box so placement can still proceed.
+                    dxmin, dymin, dxmax, dymax = -2.25, -0.42, 2.25, 0.42
+                else:
+                    dxmin = bb.Min.X - init_hx
+                    dymin = bb.Min.Y - init_hy
+                    dxmax = bb.Max.X - init_hx
+                    dymax = bb.Max.Y - init_hy
 
                 placed_ok = False
                 chosen = None
@@ -695,6 +760,7 @@ def tag_hangers_no_overlap(
             "tagged_count": len(tagged_ids),
             "skipped_already_tagged": skipped_ids,
             "could_not_clear": failed_ids,
+            "excluded_in_callout": in_callout_count,
         }
         if lengths:
             result["leader_length_ft"] = {
