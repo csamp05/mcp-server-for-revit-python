@@ -35,13 +35,13 @@ try:
         if _m == "revit_mcp.hangers" or _m.startswith("revit_mcp.hangers."):
             del sys.modules[_m]
 
-    from revit_mcp.hangers import tag_hangers_no_overlap
+    from revit_mcp.hangers import tag_hangers
 
     doc = revit.doc
     view = doc.ActiveView
     output.print_md("Active view: `{}`".format(view.Name))
 
-    result = tag_hangers_no_overlap(doc, view_name=view.Name)
+    result = tag_hangers(doc, view_name=view.Name)
 
     if result.get("status") == "success":
         output.print_md(

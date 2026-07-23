@@ -746,6 +746,21 @@ def tag_spools(doc, view_name=None, retag_existing=False):
     )
 
 
+def tag_hangers(doc, view_name=None, retag_existing=False):
+    """Tag every hanger in a view using the ganged-column layout (the manual
+    drafting style): tags stacked in columns flanking the run, horizontal
+    shoulder leaders that touch each hanger, with crossings minimised."""
+    return tag_hangers_no_overlap(
+        doc,
+        view_name=view_name,
+        hanger_category="MEP Fabrication Hangers",
+        tag_family_category="MEP Fabrication Hanger Tags",
+        avoid_categories=[],
+        retag_existing=retag_existing,
+        layout="ganged",
+    )
+
+
 def register_hanger_routes(api):
     """Register hanger-tagging routes with the API"""
     from pyrevit import routes
@@ -782,6 +797,7 @@ def register_hanger_routes(api):
                 retag_existing=data.get("retag_existing", False),
                 tag_margin=data.get("tag_margin", 0.3),
                 obstacle_margin=data.get("obstacle_margin", 0.15),
+                layout=data.get("layout", "ganged"),
             )
 
             status_code = 200 if result.get("status") == "success" else 500
