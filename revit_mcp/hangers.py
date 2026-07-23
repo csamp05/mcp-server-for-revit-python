@@ -285,6 +285,7 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
 
         row_h = max(r["h"] for r in recs) + 0.35   # consistent row spacing
         clear0 = 2.0                                 # gap from cluster to stack
+        placed_info = []                             # for the straight-leader pass
 
         # Cluster targets into small LOCAL groups (nearby in both X and Y): a
         # dense hanger location becomes a compact stack right beside it, rather
@@ -396,11 +397,74 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                             pass
                     hw = r["w"] / 2.0
                     hh = r["h"] / 2.0
-                    placed_boxes.append((hx - hw, hy - hh, hx + hw, hy + hh))
+                    box = (hx - hw, hy - hh, hx + hw, hy + hh)
+                    placed_boxes.append(box)
                     tagged_ids.append(r["el"].Id.IntegerValue)
                     lengths.append(math.hypot(hx - elbow[0], hy - elbow[1])
-                                   + math.hypot(elbow[0] - tgt[0],
-                                                elbow[1] - tgt[1]))
+                                   + math.hypot(elbow[0] - tgt[0], elbow[1] - tgt[1]))
+                    # Record for the straight-leader pass below.
+                    placed_info.append({
+                        "tag": tag, "ref": ref, "z": r["z"], "ebox": r["ebox"],
+                        "head": (hx, hy), "elbow": elbow, "tgt": tgt, "box": box,
+                        "straight": None,
+                    })
+
+        # Straight-leader pass: replace a tag's shoulder elbow with a straight
+        # leader wherever the straight line stays clear of every other leader
+        # and text box. This gives the clean hand-drawn mix of straight and
+        # doglegged leaders without ever adding a crossing or through-text.
+        def _cur_segs(info):
+            if info["straight"] is not None:
+                return [info["straight"]]
+            return [(info["tgt"], info["elbow"]),
+                    (info["elbow"], info["head"])]
+
+        for i, info in enumerate(placed_info):
+            head = info["head"]
+            st = _nearest_on_box(head[0], head[1], info["ebox"])
+            sseg = (st, head)
+            ok = True
+            for j, other in enumerate(placed_info):
+                if j == i:
+                    continue
+                if _seg_intersects_box(sseg[0], sseg[1], other["box"]):
+                    ok = False
+                    break
+                crossed = False
+                for oseg in _cur_segs(other):
+                    if _seg_intersect(sseg[0], sseg[1], oseg[0], oseg[1]):
+                        crossed = True
+                        break
+                if crossed:
+                    ok = False
+                    break
+            if ok:
+                tag = info["tag"]
+                ref = info["ref"]
+                z = info["z"]
+                try:
+                    tag.HasLeader = False
+                    doc.Regenerate()
+                    tag.HasLeader = True
+                    tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+                    tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+                    doc.Regenerate()
+                    info["straight"] = sseg
+                except Exception:
+                    pass
+
+        # Recompute reported leader lengths to reflect any straight conversions.
+        lengths[:] = []
+        for info in placed_info:
+            if info["straight"] is not None:
+                s = info["straight"]
+                lengths.append(math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]))
+            else:
+                h = info["head"]
+                e = info["elbow"]
+                tt = info["tgt"]
+                lengths.append(math.hypot(h[0] - e[0], h[1] - e[1])
+                               + math.hypot(e[0] - tt[0], e[1] - tt[1]))
 
         doc.Regenerate()
         t.Commit()
