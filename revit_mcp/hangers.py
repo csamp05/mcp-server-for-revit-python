@@ -253,9 +253,7 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
             for side, col in sides:
                 if not col:
                     continue
-                # Order the stack by target Y (top first). Tie-break by X so
-                # targets at the same height fan to the column without their
-                # leaders swapping and crossing.
+                # Order the stack by target Y (top first) as a starting point.
                 col.sort(key=lambda r: (-r["cy"], -side * r["cx"]))
                 n = len(col)
                 colw = max(r["w"] for r in col)
@@ -291,6 +289,47 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                 # the pipe cluster where there is no text. Elbows stack in row
                 # order and targets in Y order, so the angled fan cannot cross.
                 edge_x = cminx if side < 0 else cmaxx
+                slot_ys = [y_top - i * row_h for i in range(n)]
+
+                # The tags in a column are interchangeable labels, so permute
+                # which spool occupies which row to minimise leader crossings.
+                # A valid non-crossing order exists even for tightly bundled
+                # spools; the plain Y-sort misses it, so refine by swapping
+                # adjacent rows whenever that removes crossings.
+                tgts = {id(r): _nearest_on_box(edge_x, r["cy"], r["ebox"])
+                        for r in col}
+
+                def _total_cross(order):
+                    total = 0
+                    for a in range(len(order)):
+                        sa = (tgts[id(order[a])], (edge_x, slot_ys[a]))
+                        for b in range(a + 1, len(order)):
+                            sb = (tgts[id(order[b])], (edge_x, slot_ys[b]))
+                            if _seg_intersect(sa[0], sa[1], sb[0], sb[1]):
+                                total += 1
+                    return total
+
+                # Reassign spools to rows to minimise the column's total leader
+                # crossings. A non-crossing order exists even for tight bundles,
+                # so try every pairwise swap (not just adjacent) until no swap
+                # lowers the count -- this escapes the local minima that
+                # adjacent-only bubbling gets stuck in.
+                base = _total_cross(col)
+                improved = True
+                passes = 0
+                while improved and base > 0 and passes < n + 4:
+                    improved = False
+                    passes += 1
+                    for a in range(n - 1):
+                        for b in range(a + 1, n):
+                            col[a], col[b] = col[b], col[a]
+                            new = _total_cross(col)
+                            if new < base:
+                                base = new
+                                improved = True
+                            else:
+                                col[a], col[b] = col[b], col[a]
+
                 for i, r in enumerate(col):
                     hy = y_top - i * row_h
                     hx = head_x
