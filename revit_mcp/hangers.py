@@ -283,11 +283,13 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                         break
                     clear += 1.0
 
-                # Anchor every leader in this stack on a common vertical line at
-                # the cluster edge, each at its own target's Y. Heads sit on
-                # another vertical line (head_x), stacked in the same Y order, so
-                # the leaders form a fan between two vertical lines and cannot
-                # cross one another.
+                # Each leader gets a horizontal shoulder at its own row: it runs
+                # flat from the head out to an elbow on the cluster edge, then
+                # angles into the cluster to the target. The flat shoulder sits
+                # at a unique row height so it only touches its own text box (no
+                # through-text within the stack), and the angled part heads into
+                # the pipe cluster where there is no text. Elbows stack in row
+                # order and targets in Y order, so the angled fan cannot cross.
                 edge_x = cminx if side < 0 else cmaxx
                 for i, r in enumerate(col):
                     hy = y_top - i * row_h
@@ -295,14 +297,21 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                     tag = r["tag"]
                     ref = r["ref"]
                     tag.TagHeadPosition = DB.XYZ(hx, hy, r["z"])
-                    ls = (edge_x, r["cy"])
+                    elbow = (edge_x, hy)                 # shoulder end, at row Y
+                    tgt = _nearest_on_box(edge_x, r["cy"], r["ebox"])
                     if r["has_free"]:
-                        tag.SetLeaderEnd(ref, DB.XYZ(ls[0], ls[1], r["z"]))
+                        tag.SetLeaderEnd(ref, DB.XYZ(tgt[0], tgt[1], r["z"]))
+                        try:
+                            tag.SetLeaderElbow(ref, DB.XYZ(elbow[0], elbow[1], r["z"]))
+                        except Exception:
+                            pass
                     hw = r["w"] / 2.0
                     hh = r["h"] / 2.0
                     placed_boxes.append((hx - hw, hy - hh, hx + hw, hy + hh))
                     tagged_ids.append(r["el"].Id.IntegerValue)
-                    lengths.append(math.hypot(hx - ls[0], hy - ls[1]))
+                    lengths.append(math.hypot(hx - elbow[0], hy - elbow[1])
+                                   + math.hypot(elbow[0] - tgt[0],
+                                                elbow[1] - tgt[1]))
 
         doc.Regenerate()
         t.Commit()
