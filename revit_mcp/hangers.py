@@ -226,7 +226,8 @@ def _run_clusters(hangers, x_gap):
 
 
 def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
-                        to_tag, tags_to_remove, tag_margin):
+                        to_tag, tags_to_remove, tag_margin,
+                        obstacle_margin=0.15, avoid_obstacles=False):
     """Place tags in vertical columns flanking each run (the manual method).
 
     Tags stack at a fixed X beside the pipe run, ordered top-to-bottom to match
@@ -287,10 +288,92 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
         clear0 = 2.0                                 # gap from cluster to stack
         placed_info = []                             # for the straight-leader pass
 
-        # Cluster targets into small LOCAL groups (nearby in both X and Y): a
-        # dense hanger location becomes a compact stack right beside it, rather
-        # than one giant full-height column with long fanned leaders.
-        clusters = _cluster_2d(recs, dist=6.0)
+        # --- Standalone-first phase ---
+        # Most targets on a run have room for their own tag right beside them.
+        # Detect the run direction and try to give each target a standalone tag
+        # (short straight leader, offset perpendicular to the run, alternating
+        # sides). Only targets that would collide fall through to the grouped
+        # column logic below, so the result is a natural mix of spread-out
+        # standalone tags with tight groups only where the run is crowded.
+        xspread = max(r["cx"] for r in recs) - min(r["cx"] for r in recs)
+        yspread = max(r["cy"] for r in recs) - min(r["cy"] for r in recs)
+        horizontal = xspread >= yspread
+
+        def _placed_segs(p):
+            if p["straight"] is not None:
+                return [p["straight"]]
+            return [(p["tgt"], p["elbow"]), (p["elbow"], p["head"])]
+
+        def _standalone_try(r):
+            cx, cy, ebox = r["cx"], r["cy"], r["ebox"]
+            hw = r["w"] / 2.0
+            hh = r["h"] / 2.0
+            base = hh + 0.5
+            for k in range(1, 6):                    # keep standalone leaders short
+                for sgn in (1, -1):
+                    off = base + (k - 1) * row_h
+                    if horizontal:
+                        hx, hy = cx, cy + sgn * off
+                    else:
+                        hx, hy = cx + sgn * off, cy
+                    box = (hx - hw, hy - hh, hx + hw, hy + hh)
+                    if any(_box_overlap(box, p["box"], tag_margin)
+                           for p in placed_info):
+                        continue
+                    # Keep the tag off pipework / other obstacles (hangers).
+                    if avoid_obstacles and any(
+                            _box_overlap(box, ob, obstacle_margin)
+                            for ob in obstacle_boxes):
+                        continue
+                    st = _nearest_on_box(hx, hy, ebox)
+                    sseg = (st, (hx, hy))
+                    bad = False
+                    for p in placed_info:
+                        if _seg_intersects_box(sseg[0], sseg[1], p["box"]):
+                            bad = True
+                            break
+                        for ps in _placed_segs(p):
+                            if _seg_intersect(sseg[0], sseg[1], ps[0], ps[1]):
+                                bad = True
+                                break
+                        if bad:
+                            break
+                    if not bad:
+                        return (hx, hy, st, box, sseg)
+            return None
+
+        leftovers = list(recs)
+        # The standalone-first spread is used for hangers (avoid_obstacles);
+        # dense spool runs keep the proven pure-ganged layout.
+        if avoid_obstacles:
+            leftovers = []
+            for r in sorted(recs,
+                            key=lambda r: r["cx"] if horizontal else r["cy"]):
+                got = _standalone_try(r)
+                if got is None:
+                    leftovers.append(r)
+                    continue
+                hx, hy, st, box, sseg = got
+                tag = r["tag"]
+                ref = r["ref"]
+                z = r["z"]
+                tag.TagHeadPosition = DB.XYZ(hx, hy, z)
+                if r["has_free"]:
+                    tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+                doc.Regenerate()
+                placed_boxes.append(box)
+                tagged_ids.append(r["el"].Id.IntegerValue)
+                lengths.append(math.hypot(hx - st[0], hy - st[1]))
+                placed_info.append({
+                    "tag": tag, "ref": ref, "z": z, "ebox": r["ebox"],
+                    "cx": r["cx"], "cy": r["cy"],
+                    "head": (hx, hy), "elbow": None, "tgt": st, "box": box,
+                    "straight": sseg,
+                })
+
+        # Cluster the leftover (crowded) targets into small LOCAL groups and
+        # stack each in a column beside the run, as before.
+        clusters = _cluster_2d(leftovers, dist=6.0) if leftovers else []
 
         for cluster in clusters:
             cminx = min(r["cx"] for r in cluster)
@@ -312,9 +395,9 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                 y_top = ymean + (n - 1) * row_h / 2.0
 
                 # Offset the stack just clear of the local cluster; nudge out
-                # further only if it lands on an already-placed stack (which
-                # would tangle their leaders). Pipework is not avoided here so
-                # stacks stay close and leaders short.
+                # further if it lands on an already-placed stack (which would
+                # tangle their leaders) or on pipework/insulation (so grouped
+                # tags stay off the pipe too).
                 clear = clear0
                 for _ in range(40):
                     if side < 0:
@@ -327,8 +410,12 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                         head_x = edge + (colw / 2.0)
                         col_box = (edge, y_top - (n - 1) * row_h,
                                    head_x + colw / 2.0, y_top)
-                    if not any(_box_overlap(col_box, pb, 0.2)
-                               for pb in placed_boxes):
+                    hit = any(_box_overlap(col_box, pb, 0.2)
+                              for pb in placed_boxes)
+                    if not hit and avoid_obstacles:
+                        hit = any(_box_overlap(col_box, ob, obstacle_margin)
+                                  for ob in obstacle_boxes)
+                    if not hit:
                         break
                     clear += 1.0
 
@@ -422,7 +509,15 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
         # straight leader is clean. This removes the cross-cluster crossings and
         # through-text that the per-column ordering can't reach (mirrors the
         # manual "drag the outlier to a nearer column" fix).
+        def _leader_len(info):
+            return sum(math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1])
+                       for s in _cur_segs(info))
+
         def _is_bad(idx):
+            # A long leader is worth trying to shorten even if it crosses
+            # nothing (this is the outlier that gets dragged back by hand).
+            if _leader_len(placed_info[idx]) > 8.0:
+                return True
             a_segs = _cur_segs(placed_info[idx])
             for j, other in enumerate(placed_info):
                 if j == idx:
@@ -442,16 +537,22 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
             cx, cy = info["cx"], info["cy"]
             hw = (info["box"][2] - info["box"][0]) / 2.0
             hh = (info["box"][3] - info["box"][1]) / 2.0
-            cur_len = sum(math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1])
-                          for s in _cur_segs(info))
+            cur_len = _leader_len(info)
             best = None
-            for col_x in sorted(col_xs, key=lambda x: abs(x - cx)):
+            # Consider existing columns AND a standalone spot at the target's
+            # own X, so a long-leader tag can come back beside its target.
+            cands = sorted(set(col_xs + [round(cx, 1)]), key=lambda x: abs(x - cx))
+            for col_x in cands:
                 for k in range(0, 9):
                     for sgn in ((1, -1) if k else (1,)):
                         hy = cy + sgn * k * row_h
                         nb = (col_x - hw, hy - hh, col_x + hw, hy + hh)
                         if any(_box_overlap(nb, o["box"], tag_margin)
                                for o in placed_info if o is not info):
+                            continue
+                        if avoid_obstacles and any(
+                                _box_overlap(nb, ob, obstacle_margin)
+                                for ob in obstacle_boxes):
                             continue
                         st = _nearest_on_box(col_x, hy, info["ebox"])
                         ln = math.hypot(col_x - st[0], hy - st[1])
@@ -569,6 +670,7 @@ def tag_hangers_no_overlap(
     max_leader=None,
     layout="radial",
     exclude_callouts=True,
+    avoid_obstacles=False,
 ):
     """
     Tag every element of `hanger_category` visible in a view with an
@@ -743,7 +845,8 @@ def tag_hangers_no_overlap(
                            and h[0].Id.IntegerValue in already_tagged_ids]
             g_tagged, g_lengths = _tag_ganged_columns(
                 doc, view, tag_symbol, hangers, obstacle_boxes,
-                to_tag, tags_to_remove, tag_margin)
+                to_tag, tags_to_remove, tag_margin, obstacle_margin,
+                avoid_obstacles)
             result = {
                 "status": "success",
                 "view": view.Name,
@@ -966,9 +1069,11 @@ def tag_hangers(doc, view_name=None, retag_existing=False):
         view_name=view_name,
         hanger_category="MEP Fabrication Hangers",
         tag_family_category="MEP Fabrication Hanger Tags",
-        avoid_categories=[],
+        # Keep hanger tags off the pipe runs and insulation.
+        avoid_categories=["MEP Fabrication Pipework", "Insulation"],
         retag_existing=retag_existing,
         layout="ganged",
+        avoid_obstacles=True,
     )
 
 
