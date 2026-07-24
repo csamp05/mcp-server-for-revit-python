@@ -462,7 +462,7 @@ def _nudge_off_obstacles(doc, placed_info, obstacle_boxes, tag_margin,
             hx0, hy0 = info["head"]
             other_boxes = [o["box"] for o in placed_info if o is not info]
             best = None
-            for d in (0.75, 1.25, 1.75, 2.5, 3.25, 4.0, max_move):
+            for d in (0.75, 1.25, 1.75, 2.5, 3.25, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0):
                 if d > max_move:
                     break
                 for ang in range(0, 360, 20):
@@ -1013,8 +1013,10 @@ def _tag_hanger_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
         _finish_columns(doc, placed_info, obstacle_boxes,
                         tag_margin, obstacle_margin, row_h)
         # Final pass: slide any head still sitting on pipework to the nearest
-        # clear spot (bounded move, so leaders stay short).
-        _nudge_off_obstacles(doc, placed_info, obstacle_boxes, tag_margin)
+        # clear spot. Allow a longer reach (~9 ft) so tags stuck in a tight
+        # cluster can route out to a non-crossing spot.
+        _nudge_off_obstacles(doc, placed_info, obstacle_boxes, tag_margin,
+                             max_move=9.0)
         lengths[:] = _leader_lengths(placed_info)
 
         doc.Regenerate()
