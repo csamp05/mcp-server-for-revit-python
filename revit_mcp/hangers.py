@@ -365,11 +365,30 @@ def _cur_segs(info):
     return [(info["tgt"], info["elbow"]), (info["elbow"], info["head"])]
 
 
-def _measure_tags(doc, view, tag_symbol, to_tag):
+def _tag_is_unnamed(tag):
+    """True if the tag renders blank or as '?' -- i.e. the tagged element has no
+    name value. Unnamed hangers (wall brackets, Klo-Shure hangers) come through
+    this way and should be skipped rather than tagged with a '?'."""
+    try:
+        txt = tag.TagText
+    except Exception:
+        # TagText unavailable (older API): don't skip anything.
+        return False
+    if txt is None:
+        return True
+    s = txt.strip()
+    # Blank, or made up solely of question marks / whitespace.
+    return s == "" or s.replace("?", "").strip() == ""
+
+
+def _measure_tags(doc, view, tag_symbol, to_tag, skip_unnamed=False):
     """Create a tag per target and measure its head box; return rec dicts.
 
     Each tag gets a free-end leader (so the head renders where it will finally
-    sit), then the head-only box is measured with the leader hidden.
+    sit), then the head-only box is measured with the leader hidden. When
+    `skip_unnamed` is set, a tag that would render blank/'?' is deleted and its
+    target dropped (the hanger tool excludes unnamed wall brackets / Klo-Shure
+    hangers this way).
     """
     recs = []
     last_wh = [4.5, 0.85]   # fallback size if a tag can't be measured
@@ -385,6 +404,9 @@ def _measure_tags(doc, view, tag_symbol, to_tag):
             tag.LeaderEndCondition = DB.LeaderEndCondition.Free
             tag.SetLeaderEnd(ref, DB.XYZ(cx, cy, z))
         doc.Regenerate()
+        if skip_unnamed and _tag_is_unnamed(tag):
+            doc.Delete(tag.Id)
+            continue
         tag.HasLeader = False
         doc.Regenerate()
         bb = tag.get_BoundingBox(view)
@@ -646,7 +668,9 @@ def _tag_hanger_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
             tag_symbol.Activate()
             doc.Regenerate()
 
-        recs = _measure_tags(doc, view, tag_symbol, to_tag)
+        # Skip unnamed hangers (wall brackets, Klo-Shure hangers): they render
+        # as a '?' tag, so leave them untagged.
+        recs = _measure_tags(doc, view, tag_symbol, to_tag, skip_unnamed=True)
         if not recs:
             t.Commit()
             return tagged_ids, lengths
