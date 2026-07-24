@@ -152,6 +152,58 @@ def _any_overlap(box, boxes, margin):
     return False
 
 
+def _count_overlap(box, boxes, margin=0.0):
+    """Number of boxes in `boxes` that overlap `box` (explicit loop)."""
+    c = 0
+    for b in boxes:
+        if _box_overlap(box, b, margin):
+            c += 1
+    return c
+
+
+def _spread_y(desired, gap):
+    """Declutter labels along Y with minimum displacement.
+
+    Given each label's desired Y, return final Ys that keep the labels in
+    descending-desired order and at least `gap` apart, moving them as little as
+    possible. This is the manual spool-tagging behaviour: each head sits at its
+    own spool's height, nudged apart only where spools crowd. Standard
+    pool-adjacent-violators (isotonic) algorithm; input order is preserved in
+    the returned list (positions align to input indices).
+    """
+    n = len(desired)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: -desired[i])
+    # Each block: (members top-down, s) where the block's top position
+    # T = s / len(members) minimises squared displacement, and member k sits at
+    # T - k*gap. s = sum(desired[member_k] + k*gap).
+    blocks = []
+    for i in order:
+        members = [i]
+        s = desired[i]
+        while blocks:
+            pm, ps = blocks[-1]
+            t_prev = ps / len(pm)
+            t_new = s / len(members)
+            # Previous block is above; overlap if this block's top is higher
+            # than the previous block's bottom minus one gap.
+            if t_new > t_prev - len(pm) * gap:
+                members = pm + members
+                s = sum(desired[members[k]] + k * gap
+                        for k in range(len(members)))
+                blocks.pop()
+            else:
+                break
+        blocks.append((members, s))
+    pos = [0.0] * n
+    for members, s in blocks:
+        top = s / len(members)
+        for k, idx in enumerate(members):
+            pos[idx] = top - k * gap
+    return pos
+
+
 def _segments(pts):
     """Consecutive segments of a polyline given as a list of points."""
     return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
@@ -306,7 +358,7 @@ def _run_clusters(hangers, x_gap):
 def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                         to_tag, tags_to_remove, tag_margin,
                         obstacle_margin=0.15, avoid_obstacles=False,
-                        standalone_first=False):
+                        standalone_first=False, straight_columns=False):
     """Place tags in vertical columns flanking each run (the manual method).
 
     Tags stack at a fixed X beside the pipe run, ordered top-to-bottom to match
@@ -483,8 +535,12 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                 leftovers = still
 
         # Cluster the leftover (crowded) targets into small LOCAL groups and
-        # stack each in a column beside the run, as before.
-        clusters = _cluster_2d(leftovers, dist=6.0) if leftovers else []
+        # stack each in a column beside the run. Manual spool columns serve a
+        # tight vertical run, so cluster more finely there -- keeps each column's
+        # spools at a similar X, so the straight leaders stay short and nearly
+        # horizontal (less through-text).
+        cdist = 3.5 if straight_columns else 6.0
+        clusters = _cluster_2d(leftovers, dist=cdist) if leftovers else []
 
         for cluster in clusters:
             cminx = min(r["cx"] for r in cluster)
@@ -502,6 +558,61 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                 col.sort(key=lambda r: (-r["cy"], -side * r["cx"]))
                 n = len(col)
                 colw = max(r["w"] for r in col)
+
+                if straight_columns:
+                    # Manual spool style: a tight column at a fixed X about a
+                    # foot off the run's near edge, with each head beside its
+                    # OWN spool's Y (decluttered, order preserved) and a
+                    # straight, nearly horizontal leader. Measured from a
+                    # hand-tagged sheet: ~91% straight leaders, heads tracking
+                    # spool Y, ~1 ft row pitch.
+                    mrow = max(r["h"] for r in col) + 0.2
+                    head_ys = _spread_y([r["cy"] for r in col], mrow)
+                    ytop, ybot = max(head_ys), min(head_ys)
+                    cl = min(r["ebox"][0] for r in col)
+                    cr = max(r["ebox"][2] for r in col)
+                    gap = 1.0
+                    best = None
+                    push = 0.0
+                    while push <= 6.0:
+                        if side < 0:
+                            hx = cl - gap - colw / 2.0 - push
+                        else:
+                            hx = cr + gap + colw / 2.0 + push
+                        cbox = (hx - colw / 2.0, ybot - mrow,
+                                hx + colw / 2.0, ytop + mrow)
+                        tag_hit = _any_overlap(cbox, placed_boxes, 0.2)
+                        obs_hit = bool(avoid_obstacles and _any_overlap(
+                            cbox, obstacle_boxes, obstacle_margin))
+                        pen = (2.0 if tag_hit else 0.0) + (1.0 if obs_hit else 0.0)
+                        if best is None or pen < best[0]:
+                            best = (pen, hx)
+                        if pen == 0.0:
+                            break
+                        push += 1.0
+                    head_x = best[1]
+                    for i, r in enumerate(col):
+                        hy = head_ys[i]
+                        tag = r["tag"]
+                        ref = r["ref"]
+                        tgt = _leader_touch(head_x, r["cy"], r["ebox"])
+                        tag.TagHeadPosition = DB.XYZ(head_x, hy, r["z"])
+                        if r["has_free"]:
+                            tag.SetLeaderEnd(ref, DB.XYZ(tgt[0], tgt[1], r["z"]))
+                        hw = r["w"] / 2.0
+                        hh = r["h"] / 2.0
+                        box = (head_x - hw, hy - hh, head_x + hw, hy + hh)
+                        placed_boxes.append(box)
+                        tagged_ids.append(r["el"].Id.IntegerValue)
+                        lengths.append(math.hypot(head_x - tgt[0], hy - tgt[1]))
+                        placed_info.append({
+                            "tag": tag, "ref": ref, "z": r["z"],
+                            "ebox": r["ebox"], "cx": r["cx"], "cy": r["cy"],
+                            "head": (head_x, hy), "elbow": None, "tgt": tgt,
+                            "box": box, "straight": (tgt, (head_x, hy)),
+                        })
+                    continue
+
                 ymean = sum(r["cy"] for r in col) / n
                 y_top = ymean + (n - 1) * row_h / 2.0
 
@@ -895,6 +1006,7 @@ def tag_hangers_no_overlap(
     exclude_callouts=True,
     avoid_obstacles=False,
     standalone_first=False,
+    straight_columns=False,
 ):
     """
     Tag every element of `hanger_category` visible in a view with an
@@ -1070,7 +1182,7 @@ def tag_hangers_no_overlap(
             g_tagged, g_lengths = _tag_ganged_columns(
                 doc, view, tag_symbol, hangers, obstacle_boxes,
                 to_tag, tags_to_remove, tag_margin, obstacle_margin,
-                avoid_obstacles, standalone_first)
+                avoid_obstacles, standalone_first, straight_columns)
             result = {
                 "status": "success",
                 "view": view.Name,
@@ -1285,9 +1397,11 @@ def tag_spools(doc, view_name=None, retag_existing=False):
         layout="ganged",
         # Keep spool tag heads and their straight leaders off unrelated
         # pipework/insulation, while tolerating the pipe the tag sits on.
-        # Dense spool runs keep the proven pure-ganged columns (no standalone
-        # spread), so standalone_first stays False.
         avoid_obstacles=True,
+        # Manual spool style: tight columns beside the run, each head at its own
+        # spool's Y with a straight near-horizontal leader (matches hand tagging
+        # measured from a completed sheet).
+        straight_columns=True,
     )
 
 
