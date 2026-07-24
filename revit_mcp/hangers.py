@@ -73,6 +73,40 @@ def _nearest_on_box(px, py, box):
     return (nx, ny)
 
 
+def _box_point_dist(box, px, py):
+    """Distance from (px, py) to the nearest point on/inside the box (0 if
+    the point is inside)."""
+    nx, ny = _nearest_on_box(px, py, box)
+    return math.hypot(px - nx, py - ny)
+
+
+# How far inward (ft) to pull a leader end off the bbox edge toward the element
+# centre, so the end lands on the tagged geometry rather than floating at a
+# bounding-box corner.
+_LEADER_TOUCH_INSET = 0.25
+
+
+def _leader_touch(px, py, box):
+    """A leader-end point that touches the tagged element.
+
+    Starts from the point on the element's box nearest the approach (px, py) --
+    which keeps the leader short by attaching at the near edge -- then nudges it
+    inward toward the box centre by `_LEADER_TOUCH_INSET`. That inward bias
+    lands the end on the object's footprint instead of at an empty bbox corner
+    (the axis-aligned box can be larger than the geometry inside it). For a tag
+    smaller than the inset the centre itself is returned.
+    """
+    nx, ny = _nearest_on_box(px, py, box)
+    cx = (box[0] + box[2]) / 2.0
+    cy = (box[1] + box[3]) / 2.0
+    dx, dy = cx - nx, cy - ny
+    d = math.hypot(dx, dy)
+    if d <= _LEADER_TOUCH_INSET:
+        return (cx, cy)
+    f = _LEADER_TOUCH_INSET / d
+    return (nx + dx * f, ny + dy * f)
+
+
 def _seg_intersects_box(p1, p2, box):
     """True if segment p1->p2 crosses or lies inside the axis-aligned box."""
     minx, miny, maxx, maxy = box
@@ -95,12 +129,38 @@ def _seg_intersects_box(p1, p2, box):
 _PEN_TAG_OVERLAP = 100.0
 _PEN_LEADER_CROSS = 60.0
 _PEN_OBSTACLE = 45.0
+_PEN_LEADER_THRU_OBSTACLE = 40.0
 _PEN_LEADER_THRU_TEXT = 25.0
+
+# A leader legitimately terminates on the pipework/assembly it tags, so ignore
+# obstacle crossings within this distance (ft) of the leader's target end.
+# Only genuine crossings further out along the leader count against it.
+_LEADER_OBSTACLE_NEAR = 1.5
 
 
 def _segments(pts):
     """Consecutive segments of a polyline given as a list of points."""
     return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+
+
+def _leader_hits_obstacle(leader_pts, obstacles, tgt_pt,
+                          near=_LEADER_OBSTACLE_NEAR):
+    """True if the leader crosses an obstacle box away from its target end.
+
+    `leader_pts[0]` is the end that attaches to the tagged element. Obstacle
+    boxes within `near` of `tgt_pt` are ignored -- every leader legitimately
+    ends on the pipe/assembly it tags, so those crossings are expected. A
+    crossing further along the leader (over unrelated pipework or insulation)
+    is a genuine one and returns True.
+    """
+    segs = _segments(leader_pts)
+    for ob in obstacles:
+        if near > 0 and _box_point_dist(ob, tgt_pt[0], tgt_pt[1]) <= near:
+            continue
+        for a, b in segs:
+            if _seg_intersects_box(a, b, ob):
+                return True
+    return False
 
 
 def _candidate_penalty(cand_box, leader_pts, placed, obstacles,
@@ -128,6 +188,10 @@ def _candidate_penalty(cand_box, leader_pts, placed, obstacles,
     for ob in obstacles:
         if _box_overlap(cand_box, ob, obstacle_margin):
             pen += _PEN_OBSTACLE
+    # Penalise a leader that runs across an obstacle away from its own target
+    # (crossings near the target end are expected and ignored).
+    if leader_pts and _leader_hits_obstacle(leader_pts, obstacles, leader_pts[0]):
+        pen += _PEN_LEADER_THRU_OBSTACLE
     return pen
 
 
@@ -138,13 +202,13 @@ def _leader_routes(hx, hy, cx, cy, ebox):
     horizontal and horizontal-then-vertical) whose elbow lets the leader
     route around obstacles such as other tags' text.
     """
-    straight = [_nearest_on_box(hx, hy, ebox), (hx, hy)]
+    straight = [_leader_touch(hx, hy, ebox), (hx, hy)]
     # Elbow at (hx, cy): leader runs from the target out to x=hx then up to head.
     elbow_v = (hx, cy)
-    route_v = [_nearest_on_box(elbow_v[0], elbow_v[1], ebox), elbow_v, (hx, hy)]
+    route_v = [_leader_touch(elbow_v[0], elbow_v[1], ebox), elbow_v, (hx, hy)]
     # Elbow at (cx, hy): leader runs from the target across to y=hy then to head.
     elbow_h = (cx, hy)
-    route_h = [_nearest_on_box(elbow_h[0], elbow_h[1], ebox), elbow_h, (hx, hy)]
+    route_h = [_leader_touch(elbow_h[0], elbow_h[1], ebox), elbow_h, (hx, hy)]
     return [straight, route_v, route_h]
 
 
@@ -227,7 +291,8 @@ def _run_clusters(hangers, x_gap):
 
 def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                         to_tag, tags_to_remove, tag_margin,
-                        obstacle_margin=0.15, avoid_obstacles=False):
+                        obstacle_margin=0.15, avoid_obstacles=False,
+                        standalone_first=False):
     """Place tags in vertical columns flanking each run (the manual method).
 
     Tags stack at a fixed X beside the pipe run, ordered top-to-bottom to match
@@ -325,8 +390,13 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                             _box_overlap(box, ob, obstacle_margin)
                             for ob in obstacle_boxes):
                         continue
-                    st = _nearest_on_box(hx, hy, ebox)
+                    st = _leader_touch(hx, hy, ebox)
                     sseg = (st, (hx, hy))
+                    # Reject a leader that runs across unrelated pipework or
+                    # insulation (crossings near its own target are ignored).
+                    if avoid_obstacles and _leader_hits_obstacle(
+                            [st, (hx, hy)], obstacle_boxes, st):
+                        continue
                     bad = False
                     for p in placed_info:
                         if _seg_intersects_box(sseg[0], sseg[1], p["box"]):
@@ -343,9 +413,10 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
             return None
 
         leftovers = list(recs)
-        # The standalone-first spread is used for hangers (avoid_obstacles);
-        # dense spool runs keep the proven pure-ganged layout.
-        if avoid_obstacles:
+        # The standalone-first spread is used for hangers; dense spool runs keep
+        # the proven pure-ganged layout (standalone_first=False) but still get
+        # obstacle avoidance in the column pass below.
+        if standalone_first:
             leftovers = []
             for r in sorted(recs,
                             key=lambda r: r["cx"] if horizontal else r["cy"]):
@@ -434,7 +505,7 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                 # A valid non-crossing order exists even for tightly bundled
                 # spools; the plain Y-sort misses it, so refine by swapping
                 # adjacent rows whenever that removes crossings.
-                tgts = {id(r): _nearest_on_box(edge_x, r["cy"], r["ebox"])
+                tgts = {id(r): _leader_touch(edge_x, r["cy"], r["ebox"])
                         for r in col}
 
                 def _total_cross(order):
@@ -475,7 +546,7 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                     ref = r["ref"]
                     tag.TagHeadPosition = DB.XYZ(hx, hy, r["z"])
                     elbow = (edge_x, hy)                 # shoulder end, at row Y
-                    tgt = _nearest_on_box(edge_x, r["cy"], r["ebox"])
+                    tgt = _leader_touch(edge_x, r["cy"], r["ebox"])
                     if r["has_free"]:
                         tag.SetLeaderEnd(ref, DB.XYZ(tgt[0], tgt[1], r["z"]))
                         try:
@@ -514,11 +585,21 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                        for s in _cur_segs(info))
 
         def _is_bad(idx):
+            info = placed_info[idx]
             # A long leader is worth trying to shorten even if it crosses
             # nothing (this is the outlier that gets dragged back by hand).
-            if _leader_len(placed_info[idx]) > 8.0:
+            if _leader_len(info) > 8.0:
                 return True
-            a_segs = _cur_segs(placed_info[idx])
+            # A straight leader that runs across unrelated pipework/insulation
+            # (away from its own target) should be re-routed. Dogleg column
+            # leaders are left alone: they intentionally reach into the pipe
+            # cluster to touch their target.
+            if (avoid_obstacles and info["straight"] is not None
+                    and _leader_hits_obstacle(
+                        [info["tgt"], info["head"]], obstacle_boxes,
+                        info["tgt"])):
+                return True
+            a_segs = _cur_segs(info)
             for j, other in enumerate(placed_info):
                 if j == idx:
                     continue
@@ -554,11 +635,14 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                                 _box_overlap(nb, ob, obstacle_margin)
                                 for ob in obstacle_boxes):
                             continue
-                        st = _nearest_on_box(col_x, hy, info["ebox"])
+                        st = _leader_touch(col_x, hy, info["ebox"])
                         ln = math.hypot(col_x - st[0], hy - st[1])
                         if ln >= cur_len:
                             continue
                         sseg = (st, (col_x, hy))
+                        if avoid_obstacles and _leader_hits_obstacle(
+                                [st, (col_x, hy)], obstacle_boxes, st):
+                            continue
                         clean = True
                         for o in placed_info:
                             if o is info:
@@ -603,8 +687,13 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
 
         for i, info in enumerate(placed_info):
             head = info["head"]
-            st = _nearest_on_box(head[0], head[1], info["ebox"])
+            st = _leader_touch(head[0], head[1], info["ebox"])
             sseg = (st, head)
+            # Don't straighten if the direct line would newly cut across
+            # pipework/insulation the dogleg was routing around.
+            if avoid_obstacles and _leader_hits_obstacle(
+                    [st, head], obstacle_boxes, st):
+                continue
             ok = True
             for j, other in enumerate(placed_info):
                 if j == i:
@@ -671,6 +760,7 @@ def tag_hangers_no_overlap(
     layout="radial",
     exclude_callouts=True,
     avoid_obstacles=False,
+    standalone_first=False,
 ):
     """
     Tag every element of `hanger_category` visible in a view with an
@@ -846,7 +936,7 @@ def tag_hangers_no_overlap(
             g_tagged, g_lengths = _tag_ganged_columns(
                 doc, view, tag_symbol, hangers, obstacle_boxes,
                 to_tag, tags_to_remove, tag_margin, obstacle_margin,
-                avoid_obstacles)
+                avoid_obstacles, standalone_first)
             result = {
                 "status": "success",
                 "view": view.Name,
@@ -1057,6 +1147,11 @@ def tag_spools(doc, view_name=None, retag_existing=False):
         ],
         retag_existing=retag_existing,
         layout="ganged",
+        # Keep spool tag heads and their straight leaders off unrelated
+        # pipework/insulation, while tolerating the pipe the tag sits on.
+        # Dense spool runs keep the proven pure-ganged columns (no standalone
+        # spread), so standalone_first stays False.
+        avoid_obstacles=True,
     )
 
 
@@ -1074,6 +1169,9 @@ def tag_hangers(doc, view_name=None, retag_existing=False):
         retag_existing=retag_existing,
         layout="ganged",
         avoid_obstacles=True,
+        # Hangers spread out with a standalone tag each where there is room,
+        # falling back to grouped columns only in crowded stretches.
+        standalone_first=True,
     )
 
 
