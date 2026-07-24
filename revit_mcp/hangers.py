@@ -461,21 +461,27 @@ def _nudge_off_obstacles(doc, placed_info, obstacle_boxes, tag_margin,
             hh = (box[3] - box[1]) / 2.0
             hx0, hy0 = info["head"]
             other_boxes = [o["box"] for o in placed_info if o is not info]
+            # Only obstacles within reach matter -- keeps the wider search cheap.
+            reach = max_move + 6.0
+            local_obs = [ob for ob in obstacle_boxes
+                         if _box_point_dist(ob, hx0, hy0) <= reach]
             best = None
-            for d in (0.75, 1.25, 1.75, 2.5, 3.25, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0):
+            rings = [0.4, 0.55, 0.75, 1.0, 1.25, 1.75, 2.5, 3.25, 4.0, 5.0,
+                     6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+            for d in rings:
                 if d > max_move:
                     break
-                for ang in range(0, 360, 20):
+                for ang in range(0, 360, 10):
                     nx = hx0 + d * math.cos(math.radians(ang))
                     ny = hy0 + d * math.sin(math.radians(ang))
                     nb = (nx - hw, ny - hh, nx + hw, ny + hh)
-                    if _any_overlap(nb, obstacle_boxes, 0.0):
+                    if _any_overlap(nb, local_obs, 0.0):
                         continue
                     if _any_overlap(nb, other_boxes, tag_margin):
                         continue
                     st = _leader_touch(nx, ny, info["ebox"])
                     sseg = (st, (nx, ny))
-                    if _leader_hits_obstacle([st, (nx, ny)], obstacle_boxes, st):
+                    if _leader_hits_obstacle([st, (nx, ny)], local_obs, st):
                         continue
                     bad = False
                     for o in placed_info:
@@ -1016,7 +1022,7 @@ def _tag_hanger_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
         # clear spot. Allow a longer reach (~9 ft) so tags stuck in a tight
         # cluster can route out to a non-crossing spot.
         _nudge_off_obstacles(doc, placed_info, obstacle_boxes, tag_margin,
-                             max_move=9.0)
+                             max_move=12.0)
         lengths[:] = _leader_lengths(placed_info)
 
         doc.Regenerate()
