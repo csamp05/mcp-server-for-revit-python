@@ -426,6 +426,102 @@ def _measure_tags(doc, view, tag_symbol, to_tag, skip_unnamed=False):
     return recs
 
 
+def _leader_lengths(placed_info):
+    """Reported leader length per placed tag (straight or dogleg)."""
+    lengths = []
+    for info in placed_info:
+        if info["straight"] is not None:
+            s = info["straight"]
+            lengths.append(math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]))
+        else:
+            h = info["head"]
+            e = info["elbow"]
+            tt = info["tgt"]
+            lengths.append(math.hypot(h[0] - e[0], h[1] - e[1])
+                           + math.hypot(e[0] - tt[0], e[1] - tt[1]))
+    return lengths
+
+
+def _nudge_off_obstacles(doc, placed_info, obstacle_boxes, tag_margin,
+                         max_move=5.0):
+    """Slide any tag head that sits on pipework/insulation to the nearest clear
+    spot: off every obstacle, off other tags, with a straight leader that
+    crosses no other leader or text. The move is bounded (`max_move`) so leaders
+    stay short; a genuinely buried tag with no clear spot in reach is left where
+    it is rather than exiled on a long leader. Runs a few passes so tags in a
+    tight cluster (whose leaders block each other) can clear in sequence once a
+    neighbour has moved."""
+    for _ in range(4):
+        moved = False
+        for info in placed_info:
+            if not _any_overlap(info["box"], obstacle_boxes, 0.0):
+                continue                               # already clear of pipe
+            box = info["box"]
+            hw = (box[2] - box[0]) / 2.0
+            hh = (box[3] - box[1]) / 2.0
+            hx0, hy0 = info["head"]
+            other_boxes = [o["box"] for o in placed_info if o is not info]
+            best = None
+            for d in (0.75, 1.25, 1.75, 2.5, 3.25, 4.0, max_move):
+                if d > max_move:
+                    break
+                for ang in range(0, 360, 20):
+                    nx = hx0 + d * math.cos(math.radians(ang))
+                    ny = hy0 + d * math.sin(math.radians(ang))
+                    nb = (nx - hw, ny - hh, nx + hw, ny + hh)
+                    if _any_overlap(nb, obstacle_boxes, 0.0):
+                        continue
+                    if _any_overlap(nb, other_boxes, tag_margin):
+                        continue
+                    st = _leader_touch(nx, ny, info["ebox"])
+                    sseg = (st, (nx, ny))
+                    if _leader_hits_obstacle([st, (nx, ny)], obstacle_boxes, st):
+                        continue
+                    bad = False
+                    for o in placed_info:
+                        if o is info:
+                            continue
+                        if _seg_intersects_box(sseg[0], sseg[1], o["box"]):
+                            bad = True
+                            break
+                        for os in _cur_segs(o):
+                            if _seg_intersect(sseg[0], sseg[1], os[0], os[1]):
+                                bad = True
+                                break
+                        if bad:
+                            break
+                    if bad:
+                        continue
+                    ln = math.hypot(nx - st[0], ny - st[1])
+                    if best is None or ln < best[0]:
+                        best = (ln, nx, ny, st, nb, sseg)
+                if best is not None:
+                    break                   # nearest ring with a clear spot wins
+            if best is None:
+                continue
+            ln, nx, ny, st, nb, sseg = best
+            tag = info["tag"]
+            ref = info["ref"]
+            z = info["z"]
+            try:
+                tag.TagHeadPosition = DB.XYZ(nx, ny, z)
+                tag.HasLeader = False
+                doc.Regenerate()
+                tag.HasLeader = True
+                tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+                tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+                doc.Regenerate()
+                info["head"] = (nx, ny)
+                info["box"] = nb
+                info["tgt"] = st
+                info["straight"] = sseg
+                moved = True
+            except Exception:
+                pass
+        if not moved:
+            break
+
+
 def _finish_columns(doc, placed_info, obstacle_boxes, tag_margin,
                     obstacle_margin, row_h, avoid_obstacles=True):
     """Post-passes run after a column engine places its tags: migration,
@@ -633,18 +729,7 @@ def _finish_columns(doc, placed_info, obstacle_boxes, tag_margin,
         if not changed:
             break
 
-    lengths = []
-    for info in placed_info:
-        if info["straight"] is not None:
-            s = info["straight"]
-            lengths.append(math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]))
-        else:
-            h = info["head"]
-            e = info["elbow"]
-            tt = info["tgt"]
-            lengths.append(math.hypot(h[0] - e[0], h[1] - e[1])
-                           + math.hypot(e[0] - tt[0], e[1] - tt[1]))
-    return lengths
+    return _leader_lengths(placed_info)
 
 
 def _tag_hanger_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
@@ -925,8 +1010,12 @@ def _tag_hanger_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                         "straight": None,
                     })
 
-        lengths[:] = _finish_columns(doc, placed_info, obstacle_boxes,
-                                     tag_margin, obstacle_margin, row_h)
+        _finish_columns(doc, placed_info, obstacle_boxes,
+                        tag_margin, obstacle_margin, row_h)
+        # Final pass: slide any head still sitting on pipework to the nearest
+        # clear spot (bounded move, so leaders stay short).
+        _nudge_off_obstacles(doc, placed_info, obstacle_boxes, tag_margin)
+        lengths[:] = _leader_lengths(placed_info)
 
         doc.Regenerate()
         t.Commit()
