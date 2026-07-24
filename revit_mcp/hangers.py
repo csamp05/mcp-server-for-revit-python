@@ -161,6 +161,41 @@ def _count_overlap(box, boxes, margin=0.0):
     return c
 
 
+def _build_grid(boxes, cell=6.0):
+    """Bucket boxes into a uniform grid for fast local lookup. Returns
+    (grid_dict, cell). Used so a tag only checks nearby obstacles instead of the
+    thousands in a dense spool view."""
+    grid = {}
+    for b in boxes:
+        i0 = int(math.floor(b[0] / cell))
+        i1 = int(math.floor(b[2] / cell))
+        j0 = int(math.floor(b[1] / cell))
+        j1 = int(math.floor(b[3] / cell))
+        for i in range(i0, i1 + 1):
+            for j in range(j0, j1 + 1):
+                grid.setdefault((i, j), []).append(b)
+    return (grid, cell)
+
+
+def _grid_near(grid_cell, box, pad=0.0):
+    """Boxes from the grid whose cells overlap `box` (expanded by `pad`)."""
+    grid, cell = grid_cell
+    i0 = int(math.floor((box[0] - pad) / cell))
+    i1 = int(math.floor((box[2] + pad) / cell))
+    j0 = int(math.floor((box[1] - pad) / cell))
+    j1 = int(math.floor((box[3] + pad) / cell))
+    out = []
+    seen = set()
+    for i in range(i0, i1 + 1):
+        for j in range(j0, j1 + 1):
+            for b in grid.get((i, j), ()):
+                bid = id(b)
+                if bid not in seen:
+                    seen.add(bid)
+                    out.append(b)
+    return out
+
+
 def _spread_y(desired, gap):
     """Declutter labels along Y with minimum displacement.
 
@@ -382,16 +417,17 @@ def _tag_is_unnamed(tag):
 
 
 def _measure_tags(doc, view, tag_symbol, to_tag, skip_unnamed=False):
-    """Create a tag per target and measure its head box; return rec dicts.
+    """Create all tags, then measure their head boxes -- in 3 regenerations for
+    the whole set, not ~3 per tag.
 
-    Each tag gets a free-end leader (so the head renders where it will finally
-    sit), then the head-only box is measured with the leader hidden. When
+    On a large, linked model each regeneration is expensive, so per-tag regens
+    made big views crawl (and could freeze Revit). Each tag still gets a free-end
+    leader; the head-only box is measured with leaders hidden. When
     `skip_unnamed` is set, a tag that would render blank/'?' is deleted and its
-    target dropped (the hanger tool excludes unnamed wall brackets / Klo-Shure
-    hangers this way).
+    target dropped (unnamed wall brackets / Klo-Shure hangers).
     """
-    recs = []
-    last_wh = [4.5, 0.85]   # fallback size if a tag can't be measured
+    # Phase 1: create every tag with a free-end leader (one regeneration).
+    created = []
     for el, cx, cy, z, ebox in to_tag:
         ref = DB.Reference(el)
         tag = DB.IndependentTag.Create(
@@ -403,15 +439,25 @@ def _measure_tags(doc, view, tag_symbol, to_tag, skip_unnamed=False):
             tag.HasLeader = True
             tag.LeaderEndCondition = DB.LeaderEndCondition.Free
             tag.SetLeaderEnd(ref, DB.XYZ(cx, cy, z))
-        doc.Regenerate()
-        if skip_unnamed and _tag_is_unnamed(tag):
-            doc.Delete(tag.Id)
-            continue
-        tag.HasLeader = False
-        doc.Regenerate()
+        created.append((el, cx, cy, z, ebox, tag, ref, has_free))
+    doc.Regenerate()
+
+    # Phase 2: drop unnamed tags (their text renders '?').
+    kept = []
+    for rec in created:
+        if skip_unnamed and _tag_is_unnamed(rec[5]):
+            doc.Delete(rec[5].Id)
+        else:
+            kept.append(rec)
+
+    # Phase 3: hide leaders, measure text-only boxes, restore leaders.
+    for rec in kept:
+        rec[5].HasLeader = False
+    doc.Regenerate()
+    recs = []
+    last_wh = [4.5, 0.85]   # fallback size if a tag can't be measured
+    for el, cx, cy, z, ebox, tag, ref, has_free in kept:
         bb = tag.get_BoundingBox(view)
-        tag.HasLeader = True
-        doc.Regenerate()
         if bb is not None:
             w = bb.Max.X - bb.Min.X
             h = bb.Max.Y - bb.Min.Y
@@ -423,6 +469,9 @@ def _measure_tags(doc, view, tag_symbol, to_tag, skip_unnamed=False):
         recs.append({"el": el, "cx": cx, "cy": cy, "z": z, "ebox": ebox,
                      "tag": tag, "ref": ref, "has_free": has_free,
                      "w": w, "h": h})
+    for rec in kept:
+        rec[5].HasLeader = True
+    doc.Regenerate()
     return recs
 
 
@@ -446,19 +495,21 @@ _NUDGE_RINGS = [0.4, 0.55, 0.75, 1.0, 1.25, 1.75, 2.5, 3.25, 4.0, 5.0,
                 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
 
 
-def _spot_search(ebox, hx0, hy0, hw, hh, obstacle_boxes, other_tags,
-                 tag_margin, max_move):
+def _spot_search(ebox, hx0, hy0, hw, hh, obstacle_grid, other_tags,
+                 tag_margin, max_move, allow_through_text=False):
     """Nearest clear straight-leader spot for a tag of half-size (hw, hh).
 
     Searches rings/angles outward from (hx0, hy0) for a head whose box clears
     every obstacle and every box in `other_tags`, and whose straight leader to
     `ebox` crosses no obstacle (beyond its own target) and none of the leaders
-    in `other_tags`. `other_tags` is a list of (box, [leader_segments]).
-    Returns (ln, nx, ny, st, nb, sseg) or None.
+    in `other_tags`. `obstacle_grid` is a spatial grid from `_build_grid`;
+    `other_tags` is a list of (box, [leader_segments]). With `allow_through_text`
+    the leader may pass through another tag's text (normal for spools), but never
+    through another leader. Returns (ln, nx, ny, st, nb, sseg) or None.
     """
     reach = max_move + 6.0
-    local_obs = [ob for ob in obstacle_boxes
-                 if _box_point_dist(ob, hx0, hy0) <= reach]
+    local_obs = _grid_near(obstacle_grid,
+                           (hx0 - reach, hy0 - reach, hx0 + reach, hy0 + reach))
     best = None
     for d in _NUDGE_RINGS:
         if d > max_move:
@@ -476,24 +527,27 @@ def _spot_search(ebox, hx0, hy0, hw, hh, obstacle_boxes, other_tags,
                     break
             if hit:
                 continue
-            # New box must not be pierced by another tag's leader (through-text).
-            pierced = False
-            for _obox, osegs in other_tags:
-                for os in osegs:
-                    if _seg_intersects_box(os[0], os[1], nb):
-                        pierced = True
+            # New box must not be pierced by another tag's leader (through-text),
+            # unless through-text is tolerated (spools).
+            if not allow_through_text:
+                pierced = False
+                for _obox, osegs in other_tags:
+                    for os in osegs:
+                        if _seg_intersects_box(os[0], os[1], nb):
+                            pierced = True
+                            break
+                    if pierced:
                         break
                 if pierced:
-                    break
-            if pierced:
-                continue
+                    continue
             st = _leader_touch(nx, ny, ebox)
             sseg = (st, (nx, ny))
             if _leader_hits_obstacle([st, (nx, ny)], local_obs, st):
                 continue
             bad = False
             for obox, osegs in other_tags:
-                if _seg_intersects_box(sseg[0], sseg[1], obox):
+                if (not allow_through_text
+                        and _seg_intersects_box(sseg[0], sseg[1], obox)):
                     bad = True
                     break
                 for os in osegs:
@@ -513,17 +567,22 @@ def _spot_search(ebox, hx0, hy0, hw, hh, obstacle_boxes, other_tags,
 
 
 def _apply_move(doc, info, nx, ny, st, nb, sseg):
-    """Move a placed tag to (nx, ny) with a straight leader; update its record."""
+    """Move a placed tag to (nx, ny) with a straight leader; update its record.
+
+    One regeneration per move: set the head and leader end, then pin the elbow
+    on the straight line (collinear midpoint) so any prior dogleg collapses to a
+    straight leader without the expensive HasLeader off/on toggle."""
     try:
         tag = info["tag"]
         ref = info["ref"]
         z = info["z"]
         tag.TagHeadPosition = DB.XYZ(nx, ny, z)
-        tag.HasLeader = False
-        doc.Regenerate()
-        tag.HasLeader = True
-        tag.LeaderEndCondition = DB.LeaderEndCondition.Free
         tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+        try:
+            tag.SetLeaderElbow(
+                ref, DB.XYZ((st[0] + nx) / 2.0, (st[1] + ny) / 2.0, z))
+        except Exception:
+            pass
         doc.Regenerate()
         info["head"] = (nx, ny)
         info["box"] = nb
@@ -575,22 +634,29 @@ def _refresh_boxes(doc, view, placed_info):
 
 
 def _nudge_off_obstacles(doc, view, placed_info, obstacle_boxes, tag_margin,
-                         max_move=5.0):
-    """Move any tag that sits on pipework OR whose leader pierces another tag's
-    text (or is pierced by one) to the nearest clear spot: off every obstacle,
-    off other tags, straight leader crossing nothing and piercing no text.
-    Bounded move so leaders stay short; a tag with no clear spot in reach is
-    left in place.
+                         max_move=5.0, fix_through_text=True):
+    """Move any tag that sits on pipework (and, when `fix_through_text`, any tag
+    whose leader pierces another tag's text or is pierced by one) to the nearest
+    clear spot: off every obstacle, off other tags, straight leader crossing no
+    other leader. Bounded move so leaders stay short; a tag with no clear spot in
+    reach is left in place. With `fix_through_text` False the pass only clears
+    pipe and tolerates leaders through text -- the right behaviour for spools,
+    where dense wide tags make through-text normal, not a defect.
 
     Two phases: independent passes move each flagged tag on its own (repeated so
     tags whose leaders block each other clear in sequence); then a cooperative
     pass frees any still-stuck tag by relocating one blocking neighbour aside --
     the move-a-neighbour trick used when tagging tight clusters by hand."""
     _refresh_boxes(doc, view, placed_info)
+    allow_tt = not fix_through_text
+    obstacle_grid = _build_grid(obstacle_boxes, 6.0)
 
     def _needs_move(info):
-        if _any_overlap(info["box"], obstacle_boxes, 0.0):
+        if _any_overlap(info["box"],
+                        _grid_near(obstacle_grid, info["box"]), 0.0):
             return True
+        if not fix_through_text:
+            return False
         # This tag's leader passing through another tag's text.
         for seg in _cur_segs(info):
             for o in placed_info:
@@ -617,7 +683,8 @@ def _nudge_off_obstacles(doc, view, placed_info, obstacle_boxes, tag_margin,
             hx0, hy0 = info["head"]
             others = _others_of(placed_info, (info,))
             res = _spot_search(info["ebox"], hx0, hy0, hw, hh,
-                               obstacle_boxes, others, tag_margin, max_move)
+                               obstacle_grid, others, tag_margin, max_move,
+                               allow_through_text=allow_tt)
             if res is None:
                 continue
             _ln, nx, ny, st, nb, sseg = res
@@ -644,8 +711,8 @@ def _nudge_off_obstacles(doc, view, placed_info, obstacle_boxes, tag_margin,
                 # A spot for S that only N blocks (search ignoring N).
                 others_no_N = _others_of(placed_info, (S, N))
                 sres = _spot_search(S["ebox"], sx0, sy0, hwS, hhS,
-                                    obstacle_boxes, others_no_N, tag_margin,
-                                    max_move)
+                                    obstacle_grid, others_no_N, tag_margin,
+                                    max_move, allow_through_text=allow_tt)
                 if sres is None:
                     continue
                 _sl, sxn, syn, sst, snb, ssseg = sres
@@ -653,8 +720,9 @@ def _nudge_off_obstacles(doc, view, placed_info, obstacle_boxes, tag_margin,
                 hwN, hhN = _half(N)
                 others_for_N = others_no_N + [(snb, [ssseg])]
                 nres = _spot_search(N["ebox"], N["head"][0], N["head"][1],
-                                    hwN, hhN, obstacle_boxes, others_for_N,
-                                    tag_margin, max_move)
+                                    hwN, hhN, obstacle_grid, others_for_N,
+                                    tag_margin, max_move,
+                                    allow_through_text=allow_tt)
                 if nres is None:
                     continue
                 _nl, nxn, nyn, nst, nnb, nsseg = nres
@@ -755,11 +823,13 @@ def _finish_columns(doc, placed_info, obstacle_boxes, tag_margin,
             z = info["z"]
             try:
                 tag.TagHeadPosition = DB.XYZ(col_x, hy, z)
-                tag.HasLeader = False
-                doc.Regenerate()
-                tag.HasLeader = True
-                tag.LeaderEndCondition = DB.LeaderEndCondition.Free
                 tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+                try:
+                    tag.SetLeaderElbow(
+                        ref, DB.XYZ((st[0] + col_x) / 2.0,
+                                    (st[1] + hy) / 2.0, z))
+                except Exception:
+                    pass
                 doc.Regenerate()
                 info["head"] = (col_x, hy)
                 info["box"] = nb
@@ -769,6 +839,10 @@ def _finish_columns(doc, placed_info, obstacle_boxes, tag_margin,
                 pass
 
     for i, info in enumerate(placed_info):
+        # Already-straight leaders (all spool tags, standalone hangers) need no
+        # conversion -- skip them to avoid a redundant regeneration each.
+        if info["straight"] is not None:
+            continue
         head = info["head"]
         st = _leader_touch(head[0], head[1], info["ebox"])
         sseg = (st, head)
@@ -795,11 +869,13 @@ def _finish_columns(doc, placed_info, obstacle_boxes, tag_margin,
             ref = info["ref"]
             z = info["z"]
             try:
-                tag.HasLeader = False
-                doc.Regenerate()
-                tag.HasLeader = True
-                tag.LeaderEndCondition = DB.LeaderEndCondition.Free
                 tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+                try:
+                    tag.SetLeaderElbow(
+                        ref, DB.XYZ((st[0] + head[0]) / 2.0,
+                                    (st[1] + head[1]) / 2.0, z))
+                except Exception:
+                    pass
                 doc.Regenerate()
                 info["straight"] = sseg
             except Exception:
@@ -983,7 +1059,8 @@ def _tag_hanger_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
             tag.TagHeadPosition = DB.XYZ(hx, hy, z)
             if r["has_free"]:
                 tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
-            doc.Regenerate()
+            # No per-tag regeneration: placement decisions use the in-memory
+            # boxes, and the later passes regenerate in batch.
             placed_boxes.append(box)
             tagged_ids.append(r["el"].Id.IntegerValue)
             lengths.append(math.hypot(hx - st[0], hy - st[1]))
@@ -1261,8 +1338,14 @@ def _tag_spool_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                         "box": box, "straight": (tgt, (head_x, hy)),
                     })
 
-        lengths[:] = _finish_columns(doc, placed_info, obstacle_boxes,
-                                     tag_margin, obstacle_margin, row_h)
+        _finish_columns(doc, placed_info, obstacle_boxes,
+                        tag_margin, obstacle_margin, row_h)
+        # Slide any spool head still on pipework to a clear spot. Through-text is
+        # left alone (normal for dense wide spool tags), so fix_through_text is
+        # off; a modest reach keeps leaders from ballooning in the mesh.
+        _nudge_off_obstacles(doc, view, placed_info, obstacle_boxes, tag_margin,
+                             max_move=6.0, fix_through_text=False)
+        lengths[:] = _leader_lengths(placed_info)
 
         doc.Regenerate()
         t.Commit()
