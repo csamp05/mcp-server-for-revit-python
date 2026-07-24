@@ -442,88 +442,226 @@ def _leader_lengths(placed_info):
     return lengths
 
 
-def _nudge_off_obstacles(doc, placed_info, obstacle_boxes, tag_margin,
+_NUDGE_RINGS = [0.4, 0.55, 0.75, 1.0, 1.25, 1.75, 2.5, 3.25, 4.0, 5.0,
+                6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+
+
+def _spot_search(ebox, hx0, hy0, hw, hh, obstacle_boxes, other_tags,
+                 tag_margin, max_move):
+    """Nearest clear straight-leader spot for a tag of half-size (hw, hh).
+
+    Searches rings/angles outward from (hx0, hy0) for a head whose box clears
+    every obstacle and every box in `other_tags`, and whose straight leader to
+    `ebox` crosses no obstacle (beyond its own target) and none of the leaders
+    in `other_tags`. `other_tags` is a list of (box, [leader_segments]).
+    Returns (ln, nx, ny, st, nb, sseg) or None.
+    """
+    reach = max_move + 6.0
+    local_obs = [ob for ob in obstacle_boxes
+                 if _box_point_dist(ob, hx0, hy0) <= reach]
+    best = None
+    for d in _NUDGE_RINGS:
+        if d > max_move:
+            break
+        for ang in range(0, 360, 10):
+            nx = hx0 + d * math.cos(math.radians(ang))
+            ny = hy0 + d * math.sin(math.radians(ang))
+            nb = (nx - hw, ny - hh, nx + hw, ny + hh)
+            if _any_overlap(nb, local_obs, 0.0):
+                continue
+            hit = False
+            for obox, _osegs in other_tags:
+                if _box_overlap(nb, obox, tag_margin):
+                    hit = True
+                    break
+            if hit:
+                continue
+            # New box must not be pierced by another tag's leader (through-text).
+            pierced = False
+            for _obox, osegs in other_tags:
+                for os in osegs:
+                    if _seg_intersects_box(os[0], os[1], nb):
+                        pierced = True
+                        break
+                if pierced:
+                    break
+            if pierced:
+                continue
+            st = _leader_touch(nx, ny, ebox)
+            sseg = (st, (nx, ny))
+            if _leader_hits_obstacle([st, (nx, ny)], local_obs, st):
+                continue
+            bad = False
+            for obox, osegs in other_tags:
+                if _seg_intersects_box(sseg[0], sseg[1], obox):
+                    bad = True
+                    break
+                for os in osegs:
+                    if _seg_intersect(sseg[0], sseg[1], os[0], os[1]):
+                        bad = True
+                        break
+                if bad:
+                    break
+            if bad:
+                continue
+            ln = math.hypot(nx - st[0], ny - st[1])
+            if best is None or ln < best[0]:
+                best = (ln, nx, ny, st, nb, sseg)
+        if best is not None:
+            break                       # nearest ring with a clear spot wins
+    return best
+
+
+def _apply_move(doc, info, nx, ny, st, nb, sseg):
+    """Move a placed tag to (nx, ny) with a straight leader; update its record."""
+    try:
+        tag = info["tag"]
+        ref = info["ref"]
+        z = info["z"]
+        tag.TagHeadPosition = DB.XYZ(nx, ny, z)
+        tag.HasLeader = False
+        doc.Regenerate()
+        tag.HasLeader = True
+        tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+        tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+        doc.Regenerate()
+        info["head"] = (nx, ny)
+        info["box"] = nb
+        info["tgt"] = st
+        info["straight"] = sseg
+        return True
+    except Exception:
+        return False
+
+
+def _others_of(placed_info, exclude):
+    """(box, leader-segments) for every placed tag not in `exclude` (by identity)."""
+    out = []
+    for o in placed_info:
+        if any(o is e for e in exclude):
+            continue
+        out.append((o["box"], _cur_segs(o)))
+    return out
+
+
+def _half(info):
+    b = info["box"]
+    return (b[2] - b[0]) / 2.0, (b[3] - b[1]) / 2.0
+
+
+def _refresh_boxes(doc, view, placed_info):
+    """Re-measure each tag's true text box (leader hidden) and store it.
+
+    Measurement during creation can fall back to a nominal size when a tag is
+    off-crop, leaving info["box"] too small; that makes the on-pipe and
+    through-text checks miss real overlaps. One batched off/on toggle fixes the
+    boxes for the whole set cheaply (two regenerations)."""
+    for info in placed_info:
+        try:
+            info["tag"].HasLeader = False
+        except Exception:
+            pass
+    doc.Regenerate()
+    for info in placed_info:
+        bb = info["tag"].get_BoundingBox(view)
+        if bb is not None:
+            info["box"] = (bb.Min.X, bb.Min.Y, bb.Max.X, bb.Max.Y)
+    for info in placed_info:
+        try:
+            info["tag"].HasLeader = True
+        except Exception:
+            pass
+    doc.Regenerate()
+
+
+def _nudge_off_obstacles(doc, view, placed_info, obstacle_boxes, tag_margin,
                          max_move=5.0):
-    """Slide any tag head that sits on pipework/insulation to the nearest clear
-    spot: off every obstacle, off other tags, with a straight leader that
-    crosses no other leader or text. The move is bounded (`max_move`) so leaders
-    stay short; a genuinely buried tag with no clear spot in reach is left where
-    it is rather than exiled on a long leader. Runs a few passes so tags in a
-    tight cluster (whose leaders block each other) can clear in sequence once a
-    neighbour has moved."""
+    """Move any tag that sits on pipework OR whose leader pierces another tag's
+    text (or is pierced by one) to the nearest clear spot: off every obstacle,
+    off other tags, straight leader crossing nothing and piercing no text.
+    Bounded move so leaders stay short; a tag with no clear spot in reach is
+    left in place.
+
+    Two phases: independent passes move each flagged tag on its own (repeated so
+    tags whose leaders block each other clear in sequence); then a cooperative
+    pass frees any still-stuck tag by relocating one blocking neighbour aside --
+    the move-a-neighbour trick used when tagging tight clusters by hand."""
+    _refresh_boxes(doc, view, placed_info)
+
+    def _needs_move(info):
+        if _any_overlap(info["box"], obstacle_boxes, 0.0):
+            return True
+        # This tag's leader passing through another tag's text.
+        for seg in _cur_segs(info):
+            for o in placed_info:
+                if o is info:
+                    continue
+                if _seg_intersects_box(seg[0], seg[1], o["box"]):
+                    return True
+        # Another tag's leader passing through this tag's text.
+        for o in placed_info:
+            if o is info:
+                continue
+            for seg in _cur_segs(o):
+                if _seg_intersects_box(seg[0], seg[1], info["box"]):
+                    return True
+        return False
+
+    # --- Independent passes ---
     for _ in range(4):
         moved = False
         for info in placed_info:
-            if not _any_overlap(info["box"], obstacle_boxes, 0.0):
-                continue                               # already clear of pipe
-            box = info["box"]
-            hw = (box[2] - box[0]) / 2.0
-            hh = (box[3] - box[1]) / 2.0
-            hx0, hy0 = info["head"]
-            other_boxes = [o["box"] for o in placed_info if o is not info]
-            # Only obstacles within reach matter -- keeps the wider search cheap.
-            reach = max_move + 6.0
-            local_obs = [ob for ob in obstacle_boxes
-                         if _box_point_dist(ob, hx0, hy0) <= reach]
-            best = None
-            rings = [0.4, 0.55, 0.75, 1.0, 1.25, 1.75, 2.5, 3.25, 4.0, 5.0,
-                     6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
-            for d in rings:
-                if d > max_move:
-                    break
-                for ang in range(0, 360, 10):
-                    nx = hx0 + d * math.cos(math.radians(ang))
-                    ny = hy0 + d * math.sin(math.radians(ang))
-                    nb = (nx - hw, ny - hh, nx + hw, ny + hh)
-                    if _any_overlap(nb, local_obs, 0.0):
-                        continue
-                    if _any_overlap(nb, other_boxes, tag_margin):
-                        continue
-                    st = _leader_touch(nx, ny, info["ebox"])
-                    sseg = (st, (nx, ny))
-                    if _leader_hits_obstacle([st, (nx, ny)], local_obs, st):
-                        continue
-                    bad = False
-                    for o in placed_info:
-                        if o is info:
-                            continue
-                        if _seg_intersects_box(sseg[0], sseg[1], o["box"]):
-                            bad = True
-                            break
-                        for os in _cur_segs(o):
-                            if _seg_intersect(sseg[0], sseg[1], os[0], os[1]):
-                                bad = True
-                                break
-                        if bad:
-                            break
-                    if bad:
-                        continue
-                    ln = math.hypot(nx - st[0], ny - st[1])
-                    if best is None or ln < best[0]:
-                        best = (ln, nx, ny, st, nb, sseg)
-                if best is not None:
-                    break                   # nearest ring with a clear spot wins
-            if best is None:
+            if not _needs_move(info):
                 continue
-            ln, nx, ny, st, nb, sseg = best
-            tag = info["tag"]
-            ref = info["ref"]
-            z = info["z"]
-            try:
-                tag.TagHeadPosition = DB.XYZ(nx, ny, z)
-                tag.HasLeader = False
-                doc.Regenerate()
-                tag.HasLeader = True
-                tag.LeaderEndCondition = DB.LeaderEndCondition.Free
-                tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
-                doc.Regenerate()
-                info["head"] = (nx, ny)
-                info["box"] = nb
-                info["tgt"] = st
-                info["straight"] = sseg
+            hw, hh = _half(info)
+            hx0, hy0 = info["head"]
+            others = _others_of(placed_info, (info,))
+            res = _spot_search(info["ebox"], hx0, hy0, hw, hh,
+                               obstacle_boxes, others, tag_margin, max_move)
+            if res is None:
+                continue
+            _ln, nx, ny, st, nb, sseg = res
+            if _apply_move(doc, info, nx, ny, st, nb, sseg):
                 moved = True
-            except Exception:
-                pass
+        if not moved:
+            break
+
+    # --- Cooperative pass: relocate a neighbour to free a still-stuck tag. ---
+    for _ in range(3):
+        moved = False
+        for S in placed_info:
+            if not _needs_move(S):
+                continue
+            hwS, hhS = _half(S)
+            sx0, sy0 = S["head"]
+            neigh = sorted(
+                (o for o in placed_info if o is not S
+                 and math.hypot(o["head"][0] - sx0,
+                                o["head"][1] - sy0) <= 12.0),
+                key=lambda o: math.hypot(o["head"][0] - sx0,
+                                         o["head"][1] - sy0))
+            for N in neigh[:8]:
+                # A spot for S that only N blocks (search ignoring N).
+                others_no_N = _others_of(placed_info, (S, N))
+                sres = _spot_search(S["ebox"], sx0, sy0, hwS, hhS,
+                                    obstacle_boxes, others_no_N, tag_margin,
+                                    max_move)
+                if sres is None:
+                    continue
+                _sl, sxn, syn, sst, snb, ssseg = sres
+                # A new home for N that also clears S's new box and leader.
+                hwN, hhN = _half(N)
+                others_for_N = others_no_N + [(snb, [ssseg])]
+                nres = _spot_search(N["ebox"], N["head"][0], N["head"][1],
+                                    hwN, hhN, obstacle_boxes, others_for_N,
+                                    tag_margin, max_move)
+                if nres is None:
+                    continue
+                _nl, nxn, nyn, nst, nnb, nsseg = nres
+                if (_apply_move(doc, N, nxn, nyn, nst, nnb, nsseg)
+                        and _apply_move(doc, S, sxn, syn, sst, snb, ssseg)):
+                    moved = True
+                    break
         if not moved:
             break
 
@@ -1018,10 +1156,10 @@ def _tag_hanger_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
 
         _finish_columns(doc, placed_info, obstacle_boxes,
                         tag_margin, obstacle_margin, row_h)
-        # Final pass: slide any head still sitting on pipework to the nearest
-        # clear spot. Allow a longer reach (~9 ft) so tags stuck in a tight
-        # cluster can route out to a non-crossing spot.
-        _nudge_off_obstacles(doc, placed_info, obstacle_boxes, tag_margin,
+        # Final pass: move any head still on pipework, or whose leader pierces
+        # another tag's text, to the nearest clear spot (longer reach so tags in
+        # a tight cluster can route out, cooperative if a neighbour must shift).
+        _nudge_off_obstacles(doc, view, placed_info, obstacle_boxes, tag_margin,
                              max_move=12.0)
         lengths[:] = _leader_lengths(placed_info)
 
