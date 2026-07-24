@@ -355,22 +355,289 @@ def _run_clusters(hangers, x_gap):
     return runs
 
 
-def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
-                        to_tag, tags_to_remove, tag_margin,
-                        obstacle_margin=0.15, avoid_obstacles=False,
-                        standalone_first=False, straight_columns=False):
-    """Place tags in vertical columns flanking each run (the manual method).
+# --- Shared column-engine helpers (used by both the hanger and spool engines;
+# these are strategy-neutral, so sharing them does not couple the layouts). ---
 
-    Tags stack at a fixed X beside the pipe run, ordered top-to-bottom to match
-    their targets so the short inward leaders form a non-crossing fan. Big runs
-    are split across left and right columns; columns are pushed into clear
-    space off the obstacles.
+def _cur_segs(info):
+    """Leader polyline segments for a placed tag (straight, or dogleg)."""
+    if info["straight"] is not None:
+        return [info["straight"]]
+    return [(info["tgt"], info["elbow"]), (info["elbow"], info["head"])]
+
+
+def _measure_tags(doc, view, tag_symbol, to_tag):
+    """Create a tag per target and measure its head box; return rec dicts.
+
+    Each tag gets a free-end leader (so the head renders where it will finally
+    sit), then the head-only box is measured with the leader hidden.
     """
+    recs = []
+    last_wh = [4.5, 0.85]   # fallback size if a tag can't be measured
+    for el, cx, cy, z, ebox in to_tag:
+        ref = DB.Reference(el)
+        tag = DB.IndependentTag.Create(
+            doc, tag_symbol.Id, view.Id, ref, True,
+            DB.TagOrientation.Horizontal, DB.XYZ(cx, cy + 2.0, z))
+        has_free = tag.CanLeaderEndConditionBeAssigned(
+            DB.LeaderEndCondition.Free)
+        if has_free:
+            tag.HasLeader = True
+            tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+            tag.SetLeaderEnd(ref, DB.XYZ(cx, cy, z))
+        doc.Regenerate()
+        tag.HasLeader = False
+        doc.Regenerate()
+        bb = tag.get_BoundingBox(view)
+        tag.HasLeader = True
+        doc.Regenerate()
+        if bb is not None:
+            w = bb.Max.X - bb.Min.X
+            h = bb.Max.Y - bb.Min.Y
+            last_wh[0], last_wh[1] = w, h
+        else:
+            # Tag fell outside the view crop (tight callout views); reuse the
+            # last measured size.
+            w, h = last_wh[0], last_wh[1]
+        recs.append({"el": el, "cx": cx, "cy": cy, "z": z, "ebox": ebox,
+                     "tag": tag, "ref": ref, "has_free": has_free,
+                     "w": w, "h": h})
+    return recs
+
+
+def _finish_columns(doc, placed_info, obstacle_boxes, tag_margin,
+                    obstacle_margin, row_h, avoid_obstacles=True):
+    """Post-passes run after a column engine places its tags: migration,
+    straight-leader conversion, and crossing-repair by head swap. Mutates
+    `placed_info` and returns the recomputed leader lengths."""
+    def _leader_len(info):
+        total = 0.0
+        for s in _cur_segs(info):
+            total += math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1])
+        return total
+
+    def _is_bad(idx):
+        info = placed_info[idx]
+        if _leader_len(info) > 8.0:
+            return True
+        if (avoid_obstacles and info["straight"] is not None
+                and _leader_hits_obstacle(
+                    [info["tgt"], info["head"]], obstacle_boxes,
+                    info["tgt"])):
+            return True
+        a_segs = _cur_segs(info)
+        for j, other in enumerate(placed_info):
+            if j == idx:
+                continue
+            for s1 in a_segs:
+                if _seg_intersects_box(s1[0], s1[1], other["box"]):
+                    return True
+                for s2 in _cur_segs(other):
+                    if _seg_intersect(s1[0], s1[1], s2[0], s2[1]):
+                        return True
+        return False
+
+    col_xs = sorted(set([round(info["head"][0], 1) for info in placed_info]))
+    for i, info in enumerate(placed_info):
+        if not _is_bad(i):
+            continue
+        cx, cy = info["cx"], info["cy"]
+        hw = (info["box"][2] - info["box"][0]) / 2.0
+        hh = (info["box"][3] - info["box"][1]) / 2.0
+        cur_len = _leader_len(info)
+        best = None
+        cands = sorted(set(col_xs + [round(cx, 1)]), key=lambda x: abs(x - cx))
+        for col_x in cands:
+            for k in range(0, 9):
+                for sgn in ((1, -1) if k else (1,)):
+                    hy = cy + sgn * k * row_h
+                    nb = (col_x - hw, hy - hh, col_x + hw, hy + hh)
+                    if _any_overlap(nb, [o["box"] for o in placed_info
+                                         if o is not info], tag_margin):
+                        continue
+                    st = _leader_touch(col_x, hy, info["ebox"])
+                    ln = math.hypot(col_x - st[0], hy - st[1])
+                    if ln > max(cur_len, 6.0):
+                        continue
+                    sseg = (st, (col_x, hy))
+                    clean = True
+                    for o in placed_info:
+                        if o is info:
+                            continue
+                        if _seg_intersects_box(sseg[0], sseg[1], o["box"]):
+                            clean = False
+                            break
+                        for os in _cur_segs(o):
+                            if _seg_intersect(sseg[0], sseg[1], os[0], os[1]):
+                                clean = False
+                                break
+                        if not clean:
+                            break
+                    if not clean:
+                        continue
+                    obs = 0.0
+                    if avoid_obstacles:
+                        if _any_overlap(nb, obstacle_boxes, obstacle_margin):
+                            obs += 10.0
+                        if _leader_hits_obstacle([st, (col_x, hy)],
+                                                 obstacle_boxes, st):
+                            obs += 10.0
+                    score = obs + ln
+                    if best is None or score < best[3]:
+                        best = (col_x, hy, st, score, nb, sseg)
+            if best is not None:
+                break
+        if best is not None:
+            col_x, hy, st, score, nb, sseg = best
+            tag = info["tag"]
+            ref = info["ref"]
+            z = info["z"]
+            try:
+                tag.TagHeadPosition = DB.XYZ(col_x, hy, z)
+                tag.HasLeader = False
+                doc.Regenerate()
+                tag.HasLeader = True
+                tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+                tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+                doc.Regenerate()
+                info["head"] = (col_x, hy)
+                info["box"] = nb
+                info["tgt"] = st
+                info["straight"] = sseg
+            except Exception:
+                pass
+
+    for i, info in enumerate(placed_info):
+        head = info["head"]
+        st = _leader_touch(head[0], head[1], info["ebox"])
+        sseg = (st, head)
+        if avoid_obstacles and _leader_hits_obstacle(
+                [st, head], obstacle_boxes, st):
+            continue
+        ok = True
+        for j, other in enumerate(placed_info):
+            if j == i:
+                continue
+            if _seg_intersects_box(sseg[0], sseg[1], other["box"]):
+                ok = False
+                break
+            crossed = False
+            for oseg in _cur_segs(other):
+                if _seg_intersect(sseg[0], sseg[1], oseg[0], oseg[1]):
+                    crossed = True
+                    break
+            if crossed:
+                ok = False
+                break
+        if ok:
+            tag = info["tag"]
+            ref = info["ref"]
+            z = info["z"]
+            try:
+                tag.HasLeader = False
+                doc.Regenerate()
+                tag.HasLeader = True
+                tag.LeaderEndCondition = DB.LeaderEndCondition.Free
+                tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
+                doc.Regenerate()
+                info["straight"] = sseg
+            except Exception:
+                pass
+
+    def _pair_crosses(a, b):
+        for s1 in _cur_segs(a):
+            for s2 in _cur_segs(b):
+                if _seg_intersect(s1[0], s1[1], s2[0], s2[1]):
+                    return True
+        return False
+
+    def _try_head_swap(i, j):
+        A = placed_info[i]
+        B = placed_info[j]
+        if A["straight"] is None or B["straight"] is None:
+            return False
+
+        def _rebox(info, head):
+            hw = (info["box"][2] - info["box"][0]) / 2.0
+            hh = (info["box"][3] - info["box"][1]) / 2.0
+            return (head[0] - hw, head[1] - hh, head[0] + hw, head[1] + hh)
+
+        hA, hB = B["head"], A["head"]
+        boxA, boxB = _rebox(A, hA), _rebox(B, hB)
+        stA = _leader_touch(hA[0], hA[1], A["ebox"])
+        stB = _leader_touch(hB[0], hB[1], B["ebox"])
+        segA, segB = (stA, hA), (stB, hB)
+        if _box_overlap(boxA, boxB, tag_margin):
+            return False
+        if _seg_intersect(segA[0], segA[1], segB[0], segB[1]):
+            return False
+        if (_seg_intersects_box(segA[0], segA[1], boxB)
+                or _seg_intersects_box(segB[0], segB[1], boxA)):
+            return False
+        for k, o in enumerate(placed_info):
+            if k == i or k == j:
+                continue
+            if (_box_overlap(boxA, o["box"], tag_margin)
+                    or _box_overlap(boxB, o["box"], tag_margin)):
+                return False
+            for seg in (segA, segB):
+                if _seg_intersects_box(seg[0], seg[1], o["box"]):
+                    return False
+                for os in _cur_segs(o):
+                    if _seg_intersect(seg[0], seg[1], os[0], os[1]):
+                        return False
+        try:
+            for info, head, st, box in ((A, hA, stA, boxA),
+                                        (B, hB, stB, boxB)):
+                info["tag"].TagHeadPosition = DB.XYZ(head[0], head[1], info["z"])
+                if info["ref"] is not None:
+                    info["tag"].SetLeaderEnd(
+                        info["ref"], DB.XYZ(st[0], st[1], info["z"]))
+                info["head"] = head
+                info["tgt"] = st
+                info["box"] = box
+                info["straight"] = (st, head)
+            doc.Regenerate()
+            return True
+        except Exception:
+            return False
+
+    for _ in range(4):
+        changed = False
+        for a in range(len(placed_info)):
+            for b in range(a + 1, len(placed_info)):
+                if _pair_crosses(placed_info[a], placed_info[b]):
+                    if _try_head_swap(a, b):
+                        changed = True
+        if not changed:
+            break
+
+    lengths = []
+    for info in placed_info:
+        if info["straight"] is not None:
+            s = info["straight"]
+            lengths.append(math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]))
+        else:
+            h = info["head"]
+            e = info["elbow"]
+            tt = info["tgt"]
+            lengths.append(math.hypot(h[0] - e[0], h[1] - e[1])
+                           + math.hypot(e[0] - tt[0], e[1] - tt[1]))
+    return lengths
+
+
+def _tag_hanger_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
+                        to_tag, tags_to_remove, tag_margin,
+                        obstacle_margin=0.15):
+    """Hanger layout (independent of the spool engine): give each hanger a
+    standalone tag with a short leader where there is room, and fall back to
+    grouped dogleg columns only in crowded stretches. Shared post-passes then
+    shorten long leaders, straighten where clean, and repair crossings."""
     tagged_ids = []
     lengths = []
     placed_boxes = []
+    avoid_obstacles = True
 
-    t = DB.Transaction(doc, "Tag - Ganged Columns")
+    t = DB.Transaction(doc, "Tag Hangers - Columns")
     t.Start()
     try:
         for tid in tags_to_remove:
@@ -379,38 +646,7 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
             tag_symbol.Activate()
             doc.Regenerate()
 
-        # Pass 1: create each tag, establish its leader, measure its head box.
-        recs = []
-        _last_wh = [4.5, 0.85]   # fallback size if a tag can't be measured
-        for el, cx, cy, z, ebox in to_tag:
-            ref = DB.Reference(el)
-            tag = DB.IndependentTag.Create(
-                doc, tag_symbol.Id, view.Id, ref, True,
-                DB.TagOrientation.Horizontal, DB.XYZ(cx, cy + 2.0, z))
-            has_free = tag.CanLeaderEndConditionBeAssigned(
-                DB.LeaderEndCondition.Free)
-            if has_free:
-                tag.HasLeader = True
-                tag.LeaderEndCondition = DB.LeaderEndCondition.Free
-                tag.SetLeaderEnd(ref, DB.XYZ(cx, cy, z))
-            doc.Regenerate()
-            tag.HasLeader = False
-            doc.Regenerate()
-            bb = tag.get_BoundingBox(view)
-            tag.HasLeader = True
-            doc.Regenerate()
-            if bb is not None:
-                w = bb.Max.X - bb.Min.X
-                h = bb.Max.Y - bb.Min.Y
-                _last_wh[0], _last_wh[1] = w, h
-            else:
-                # Tag fell outside the view crop (common on tight callout
-                # views); fall back to the last measured size.
-                w, h = _last_wh[0], _last_wh[1]
-            recs.append({"el": el, "cx": cx, "cy": cy, "z": z, "ebox": ebox,
-                         "tag": tag, "ref": ref, "has_free": has_free,
-                         "w": w, "h": h})
-
+        recs = _measure_tags(doc, view, tag_symbol, to_tag)
         if not recs:
             t.Commit()
             return tagged_ids, lengths
@@ -505,42 +741,34 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                 "straight": sseg,
             })
 
-        leftovers = list(recs)
-        # The standalone-first spread is used for hangers; dense spool runs keep
-        # the proven pure-ganged layout (standalone_first=False) but still get
-        # obstacle avoidance in the column pass below.
-        if standalone_first:
-            ordered = sorted(recs,
-                             key=lambda r: r["cx"] if horizontal else r["cy"])
-            # Pass 1: give each target a fully-clear standalone tag if possible.
-            leftovers = []
-            for r in ordered:
-                got = _standalone_try(r, allow_obstacle=False)
+        # --- Standalone-first phase (hangers) ---
+        # Give each target a standalone tag where there is room; only the
+        # colliding ones fall through to grouped columns below.
+        ordered = sorted(recs,
+                         key=lambda r: r["cx"] if horizontal else r["cy"])
+        # Pass 1: fully-clear standalone tags.
+        leftovers = []
+        for r in ordered:
+            got = _standalone_try(r, allow_obstacle=False)
+            if got is None:
+                leftovers.append(r)
+            else:
+                _place_standalone(r, got)
+        # Pass 2: a buried target with no clear spot gets the shortest standalone
+        # leader that still avoids other tags and crossings, tolerating a tag
+        # over pipework rather than a long, crossing leader.
+        if leftovers:
+            still = []
+            for r in leftovers:
+                got = _standalone_try(r, allow_obstacle=True)
                 if got is None:
-                    leftovers.append(r)
+                    still.append(r)
                 else:
                     _place_standalone(r, got)
-            # Pass 2: a buried target with no clear spot gets the shortest
-            # standalone leader that still avoids other tags and crossings,
-            # tolerating a tag over pipework. This keeps it close rather than
-            # pushing it out on a long, crossing leader.
-            if avoid_obstacles and leftovers:
-                still = []
-                for r in leftovers:
-                    got = _standalone_try(r, allow_obstacle=True)
-                    if got is None:
-                        still.append(r)
-                    else:
-                        _place_standalone(r, got)
-                leftovers = still
+            leftovers = still
 
-        # Cluster the leftover (crowded) targets into small LOCAL groups and
-        # stack each in a column beside the run. Manual spool columns serve a
-        # tight vertical run, so cluster more finely there -- keeps each column's
-        # spools at a similar X, so the straight leaders stay short and nearly
-        # horizontal (less through-text).
-        cdist = 3.5 if straight_columns else 6.0
-        clusters = _cluster_2d(leftovers, dist=cdist) if leftovers else []
+        # Cluster the crowded leftovers and stack each in a dogleg column.
+        clusters = _cluster_2d(leftovers, dist=6.0) if leftovers else []
 
         for cluster in clusters:
             cminx = min(r["cx"] for r in cluster)
@@ -558,60 +786,6 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                 col.sort(key=lambda r: (-r["cy"], -side * r["cx"]))
                 n = len(col)
                 colw = max(r["w"] for r in col)
-
-                if straight_columns:
-                    # Manual spool style: a tight column at a fixed X about a
-                    # foot off the run's near edge, with each head beside its
-                    # OWN spool's Y (decluttered, order preserved) and a
-                    # straight, nearly horizontal leader. Measured from a
-                    # hand-tagged sheet: ~91% straight leaders, heads tracking
-                    # spool Y, ~1 ft row pitch.
-                    mrow = max(r["h"] for r in col) + 0.2
-                    head_ys = _spread_y([r["cy"] for r in col], mrow)
-                    ytop, ybot = max(head_ys), min(head_ys)
-                    cl = min(r["ebox"][0] for r in col)
-                    cr = max(r["ebox"][2] for r in col)
-                    gap = 1.0
-                    best = None
-                    push = 0.0
-                    while push <= 6.0:
-                        if side < 0:
-                            hx = cl - gap - colw / 2.0 - push
-                        else:
-                            hx = cr + gap + colw / 2.0 + push
-                        cbox = (hx - colw / 2.0, ybot - mrow,
-                                hx + colw / 2.0, ytop + mrow)
-                        tag_hit = _any_overlap(cbox, placed_boxes, 0.2)
-                        obs_hit = bool(avoid_obstacles and _any_overlap(
-                            cbox, obstacle_boxes, obstacle_margin))
-                        pen = (2.0 if tag_hit else 0.0) + (1.0 if obs_hit else 0.0)
-                        if best is None or pen < best[0]:
-                            best = (pen, hx)
-                        if pen == 0.0:
-                            break
-                        push += 1.0
-                    head_x = best[1]
-                    for i, r in enumerate(col):
-                        hy = head_ys[i]
-                        tag = r["tag"]
-                        ref = r["ref"]
-                        tgt = _leader_touch(head_x, r["cy"], r["ebox"])
-                        tag.TagHeadPosition = DB.XYZ(head_x, hy, r["z"])
-                        if r["has_free"]:
-                            tag.SetLeaderEnd(ref, DB.XYZ(tgt[0], tgt[1], r["z"]))
-                        hw = r["w"] / 2.0
-                        hh = r["h"] / 2.0
-                        box = (head_x - hw, hy - hh, head_x + hw, hy + hh)
-                        placed_boxes.append(box)
-                        tagged_ids.append(r["el"].Id.IntegerValue)
-                        lengths.append(math.hypot(head_x - tgt[0], hy - tgt[1]))
-                        placed_info.append({
-                            "tag": tag, "ref": ref, "z": r["z"],
-                            "ebox": r["ebox"], "cx": r["cx"], "cy": r["cy"],
-                            "head": (head_x, hy), "elbow": None, "tgt": tgt,
-                            "box": box, "straight": (tgt, (head_x, hy)),
-                        })
-                    continue
 
                 ymean = sum(r["cy"] for r in col) / n
                 y_top = ymean + (n - 1) * row_h / 2.0
@@ -727,260 +901,109 @@ def _tag_ganged_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
                         "straight": None,
                     })
 
-        def _cur_segs(info):
-            if info["straight"] is not None:
-                return [info["straight"]]
-            return [(info["tgt"], info["elbow"]),
-                    (info["elbow"], info["head"])]
+        lengths[:] = _finish_columns(doc, placed_info, obstacle_boxes,
+                                     tag_margin, obstacle_margin, row_h)
 
-        # Migration pass: a tag whose leader crosses another leader or clips
-        # another tag's text is almost always one the greedy clustering placed
-        # in a far column. Move it to the nearest column with a free row where a
-        # straight leader is clean. This removes the cross-cluster crossings and
-        # through-text that the per-column ordering can't reach (mirrors the
-        # manual "drag the outlier to a nearer column" fix).
-        def _leader_len(info):
-            return sum(math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1])
-                       for s in _cur_segs(info))
+        doc.Regenerate()
+        t.Commit()
+    except Exception:
+        t.RollBack()
+        raise
+    return tagged_ids, lengths
 
-        def _is_bad(idx):
-            info = placed_info[idx]
-            # A long leader is worth trying to shorten even if it crosses
-            # nothing (this is the outlier that gets dragged back by hand).
-            if _leader_len(info) > 8.0:
-                return True
-            # A straight leader that runs across unrelated pipework/insulation
-            # (away from its own target) should be re-routed. Dogleg column
-            # leaders are left alone: they intentionally reach into the pipe
-            # cluster to touch their target.
-            if (avoid_obstacles and info["straight"] is not None
-                    and _leader_hits_obstacle(
-                        [info["tgt"], info["head"]], obstacle_boxes,
-                        info["tgt"])):
-                return True
-            a_segs = _cur_segs(info)
-            for j, other in enumerate(placed_info):
-                if j == idx:
+
+def _tag_spool_columns(doc, view, tag_symbol, hangers, obstacle_boxes,
+                       to_tag, tags_to_remove, tag_margin,
+                       obstacle_margin=0.15):
+    """Spool layout (independent of the hanger engine): tight columns beside
+    each run, each head at its own spool's decluttered Y with a straight,
+    nearly horizontal fanned leader -- the hand-tagging style. Crowded runs are
+    split left/right; the shared post-passes then repair any crossings."""
+    avoid_obstacles = True
+    tagged_ids = []
+    lengths = []
+    placed_boxes = []
+
+    t = DB.Transaction(doc, "Tag Spools - Columns")
+    t.Start()
+    try:
+        for tid in tags_to_remove:
+            doc.Delete(tid)
+        if not tag_symbol.IsActive:
+            tag_symbol.Activate()
+            doc.Regenerate()
+
+        recs = _measure_tags(doc, view, tag_symbol, to_tag)
+        if not recs:
+            t.Commit()
+            return tagged_ids, lengths
+
+        row_h = max(r["h"] for r in recs) + 0.35
+        placed_info = []
+
+        # Cluster spools into local groups; each side of a group gets a tight
+        # straight-fan column.
+        clusters = _cluster_2d(recs, dist=3.5)
+        for cluster in clusters:
+            cluster.sort(key=lambda r: r["cx"])
+            mid = (len(cluster) + 1) // 2
+            sides = [(-1, cluster[:mid]), (1, cluster[mid:])]
+            for side, col in sides:
+                if not col:
                     continue
-                for s1 in a_segs:
-                    if _seg_intersects_box(s1[0], s1[1], other["box"]):
-                        return True
-                    for s2 in _cur_segs(other):
-                        if _seg_intersect(s1[0], s1[1], s2[0], s2[1]):
-                            return True
-            return False
-
-        col_xs = sorted(set([round(info["head"][0], 1) for info in placed_info]))
-        for i, info in enumerate(placed_info):
-            if not _is_bad(i):
-                continue
-            cx, cy = info["cx"], info["cy"]
-            hw = (info["box"][2] - info["box"][0]) / 2.0
-            hh = (info["box"][3] - info["box"][1]) / 2.0
-            cur_len = _leader_len(info)
-            best = None
-            # Consider existing columns AND a standalone spot at the target's
-            # own X, so a long-leader tag can come back beside its target.
-            cands = sorted(set(col_xs + [round(cx, 1)]), key=lambda x: abs(x - cx))
-            for col_x in cands:
-                for k in range(0, 9):
-                    for sgn in ((1, -1) if k else (1,)):
-                        hy = cy + sgn * k * row_h
-                        nb = (col_x - hw, hy - hh, col_x + hw, hy + hh)
-                        # Never sit on another tag -- hard rule.
-                        if _any_overlap(nb, [o["box"] for o in placed_info
-                                             if o is not info], tag_margin):
-                            continue
-                        st = _leader_touch(col_x, hy, info["ebox"])
-                        ln = math.hypot(col_x - st[0], hy - st[1])
-                        # Keep the replacement leader bounded: shorter is ideal,
-                        # but a comparable-length spot that removes a crossing is
-                        # worth taking too. Never grow past the cap.
-                        if ln > max(cur_len, 6.0):
-                            continue
-                        sseg = (st, (col_x, hy))
-                        # Hard goal of this pass: the new straight leader must
-                        # cross no other leader and pass through no other text.
-                        clean = True
-                        for o in placed_info:
-                            if o is info:
-                                continue
-                            if _seg_intersects_box(sseg[0], sseg[1], o["box"]):
-                                clean = False
-                                break
-                            for os in _cur_segs(o):
-                                if _seg_intersect(sseg[0], sseg[1], os[0], os[1]):
-                                    clean = False
-                                    break
-                            if not clean:
-                                break
-                        if not clean:
-                            continue
-                        # Prefer a spot clear of pipework, but tolerate a tag
-                        # over a pipe rather than leave the crossing unfixed.
-                        obs = 0.0
-                        if avoid_obstacles:
-                            if _any_overlap(nb, obstacle_boxes, obstacle_margin):
-                                obs += 10.0
-                            if _leader_hits_obstacle([st, (col_x, hy)],
-                                                     obstacle_boxes, st):
-                                obs += 10.0
-                        score = obs + ln
-                        if best is None or score < best[3]:
-                            best = (col_x, hy, st, score, nb, sseg)
-                if best is not None:
-                    break   # nearest column that offers a clean spot wins
-            if best is not None:
-                col_x, hy, st, score, nb, sseg = best
-                tag = info["tag"]
-                ref = info["ref"]
-                z = info["z"]
-                try:
-                    tag.TagHeadPosition = DB.XYZ(col_x, hy, z)
-                    tag.HasLeader = False
-                    doc.Regenerate()
-                    tag.HasLeader = True
-                    tag.LeaderEndCondition = DB.LeaderEndCondition.Free
-                    tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
-                    doc.Regenerate()
-                    info["head"] = (col_x, hy)
-                    info["box"] = nb
-                    info["tgt"] = st
-                    info["straight"] = sseg
-                except Exception:
-                    pass
-
-        # Straight-leader pass: replace a tag's shoulder elbow with a straight
-        # leader wherever the straight line stays clear of every other leader
-        # and text box. This gives the clean hand-drawn mix of straight and
-        # doglegged leaders without ever adding a crossing or through-text.
-
-        for i, info in enumerate(placed_info):
-            head = info["head"]
-            st = _leader_touch(head[0], head[1], info["ebox"])
-            sseg = (st, head)
-            # Don't straighten if the direct line would newly cut across
-            # pipework/insulation the dogleg was routing around.
-            if avoid_obstacles and _leader_hits_obstacle(
-                    [st, head], obstacle_boxes, st):
-                continue
-            ok = True
-            for j, other in enumerate(placed_info):
-                if j == i:
-                    continue
-                if _seg_intersects_box(sseg[0], sseg[1], other["box"]):
-                    ok = False
-                    break
-                crossed = False
-                for oseg in _cur_segs(other):
-                    if _seg_intersect(sseg[0], sseg[1], oseg[0], oseg[1]):
-                        crossed = True
+                col.sort(key=lambda r: (-r["cy"], -side * r["cx"]))
+                colw = max(r["w"] for r in col)
+                # Manual spool style: fixed column X ~1 ft off the run's near
+                # edge; each head at its own spool's Y (decluttered, order
+                # preserved); straight near-horizontal leaders.
+                mrow = max(r["h"] for r in col) + 0.2
+                head_ys = _spread_y([r["cy"] for r in col], mrow)
+                ytop, ybot = max(head_ys), min(head_ys)
+                cl = min(r["ebox"][0] for r in col)
+                cr = max(r["ebox"][2] for r in col)
+                gap = 1.0
+                best = None
+                push = 0.0
+                while push <= 6.0:
+                    if side < 0:
+                        hx = cl - gap - colw / 2.0 - push
+                    else:
+                        hx = cr + gap + colw / 2.0 + push
+                    cbox = (hx - colw / 2.0, ybot - mrow,
+                            hx + colw / 2.0, ytop + mrow)
+                    tag_hit = _any_overlap(cbox, placed_boxes, 0.2)
+                    obs_hit = bool(avoid_obstacles and _any_overlap(
+                        cbox, obstacle_boxes, obstacle_margin))
+                    pen = (2.0 if tag_hit else 0.0) + (1.0 if obs_hit else 0.0)
+                    if best is None or pen < best[0]:
+                        best = (pen, hx)
+                    if pen == 0.0:
                         break
-                if crossed:
-                    ok = False
-                    break
-            if ok:
-                tag = info["tag"]
-                ref = info["ref"]
-                z = info["z"]
-                try:
-                    tag.HasLeader = False
-                    doc.Regenerate()
-                    tag.HasLeader = True
-                    tag.LeaderEndCondition = DB.LeaderEndCondition.Free
-                    tag.SetLeaderEnd(ref, DB.XYZ(st[0], st[1], z))
-                    doc.Regenerate()
-                    info["straight"] = sseg
-                except Exception:
-                    pass
+                    push += 1.0
+                head_x = best[1]
+                for i, r in enumerate(col):
+                    hy = head_ys[i]
+                    tag = r["tag"]
+                    ref = r["ref"]
+                    tgt = _leader_touch(head_x, r["cy"], r["ebox"])
+                    tag.TagHeadPosition = DB.XYZ(head_x, hy, r["z"])
+                    if r["has_free"]:
+                        tag.SetLeaderEnd(ref, DB.XYZ(tgt[0], tgt[1], r["z"]))
+                    hw = r["w"] / 2.0
+                    hh = r["h"] / 2.0
+                    box = (head_x - hw, hy - hh, head_x + hw, hy + hh)
+                    placed_boxes.append(box)
+                    tagged_ids.append(r["el"].Id.IntegerValue)
+                    lengths.append(math.hypot(head_x - tgt[0], hy - tgt[1]))
+                    placed_info.append({
+                        "tag": tag, "ref": ref, "z": r["z"],
+                        "ebox": r["ebox"], "cx": r["cx"], "cy": r["cy"],
+                        "head": (head_x, hy), "elbow": None, "tgt": tgt,
+                        "box": box, "straight": (tgt, (head_x, hy)),
+                    })
 
-        # Crossing-repair pass: two straight-leader tags whose leaders cross can
-        # often be un-crossed by swapping their head positions -- each keeps its
-        # own target, so the two leaders trade sides. Apply a swap only when the
-        # swapped pair crosses nothing (each other, any other leader, or any
-        # text box), so total crossings can only fall. This resolves the tight
-        # two-into-one-column fans the per-tag passes place independently.
-        def _pair_crosses(a, b):
-            for s1 in _cur_segs(a):
-                for s2 in _cur_segs(b):
-                    if _seg_intersect(s1[0], s1[1], s2[0], s2[1]):
-                        return True
-            return False
-
-        def _try_head_swap(i, j):
-            A = placed_info[i]
-            B = placed_info[j]
-            if A["straight"] is None or B["straight"] is None:
-                return False
-
-            def _rebox(info, head):
-                hw = (info["box"][2] - info["box"][0]) / 2.0
-                hh = (info["box"][3] - info["box"][1]) / 2.0
-                return (head[0] - hw, head[1] - hh, head[0] + hw, head[1] + hh)
-
-            hA, hB = B["head"], A["head"]          # swap the two head positions
-            boxA, boxB = _rebox(A, hA), _rebox(B, hB)
-            stA = _leader_touch(hA[0], hA[1], A["ebox"])
-            stB = _leader_touch(hB[0], hB[1], B["ebox"])
-            segA, segB = (stA, hA), (stB, hB)
-            if _box_overlap(boxA, boxB, tag_margin):
-                return False
-            if _seg_intersect(segA[0], segA[1], segB[0], segB[1]):
-                return False
-            if (_seg_intersects_box(segA[0], segA[1], boxB)
-                    or _seg_intersects_box(segB[0], segB[1], boxA)):
-                return False
-            for k, o in enumerate(placed_info):
-                if k == i or k == j:
-                    continue
-                if (_box_overlap(boxA, o["box"], tag_margin)
-                        or _box_overlap(boxB, o["box"], tag_margin)):
-                    return False
-                for seg in (segA, segB):
-                    if _seg_intersects_box(seg[0], seg[1], o["box"]):
-                        return False
-                    for os in _cur_segs(o):
-                        if _seg_intersect(seg[0], seg[1], os[0], os[1]):
-                            return False
-            # Accepted -- move both tags and update their records.
-            try:
-                for info, head, st, box in ((A, hA, stA, boxA),
-                                            (B, hB, stB, boxB)):
-                    info["tag"].TagHeadPosition = DB.XYZ(head[0], head[1], info["z"])
-                    if info["ref"] is not None:
-                        info["tag"].SetLeaderEnd(
-                            info["ref"], DB.XYZ(st[0], st[1], info["z"]))
-                    info["head"] = head
-                    info["tgt"] = st
-                    info["box"] = box
-                    info["straight"] = (st, head)
-                doc.Regenerate()
-                return True
-            except Exception:
-                return False
-
-        for _ in range(4):
-            changed = False
-            for a in range(len(placed_info)):
-                for b in range(a + 1, len(placed_info)):
-                    if _pair_crosses(placed_info[a], placed_info[b]):
-                        if _try_head_swap(a, b):
-                            changed = True
-            if not changed:
-                break
-
-        # Recompute reported leader lengths to reflect any straight conversions.
-        lengths[:] = []
-        for info in placed_info:
-            if info["straight"] is not None:
-                s = info["straight"]
-                lengths.append(math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]))
-            else:
-                h = info["head"]
-                e = info["elbow"]
-                tt = info["tgt"]
-                lengths.append(math.hypot(h[0] - e[0], h[1] - e[1])
-                               + math.hypot(e[0] - tt[0], e[1] - tt[1]))
+        lengths[:] = _finish_columns(doc, placed_info, obstacle_boxes,
+                                     tag_margin, obstacle_margin, row_h)
 
         doc.Regenerate()
         t.Commit()
@@ -1005,8 +1028,7 @@ def tag_hangers_no_overlap(
     layout="radial",
     exclude_callouts=True,
     avoid_obstacles=False,
-    standalone_first=False,
-    straight_columns=False,
+    kind="hanger",
 ):
     """
     Tag every element of `hanger_category` visible in a view with an
@@ -1171,7 +1193,7 @@ def tag_hangers_no_overlap(
                     if retag_existing:
                         tags_to_remove.append(tg.Id)
 
-        # Ganged-column layout: stack tags in vertical columns beside each run.
+        # Ganged-column layout: dispatch to the independent per-tool engine.
         if layout == "ganged":
             to_tag = [h for h in hangers
                       if retag_existing
@@ -1179,10 +1201,11 @@ def tag_hangers_no_overlap(
             skipped_ids = [h[0].Id.IntegerValue for h in hangers
                            if not retag_existing
                            and h[0].Id.IntegerValue in already_tagged_ids]
-            g_tagged, g_lengths = _tag_ganged_columns(
+            engine = (_tag_spool_columns if kind == "spool"
+                      else _tag_hanger_columns)
+            g_tagged, g_lengths = engine(
                 doc, view, tag_symbol, hangers, obstacle_boxes,
-                to_tag, tags_to_remove, tag_margin, obstacle_margin,
-                avoid_obstacles, standalone_first, straight_columns)
+                to_tag, tags_to_remove, tag_margin, obstacle_margin)
             result = {
                 "status": "success",
                 "view": view.Name,
@@ -1395,13 +1418,8 @@ def tag_spools(doc, view_name=None, retag_existing=False):
         ],
         retag_existing=retag_existing,
         layout="ganged",
-        # Keep spool tag heads and their straight leaders off unrelated
-        # pipework/insulation, while tolerating the pipe the tag sits on.
-        avoid_obstacles=True,
-        # Manual spool style: tight columns beside the run, each head at its own
-        # spool's Y with a straight near-horizontal leader (matches hand tagging
-        # measured from a completed sheet).
-        straight_columns=True,
+        # Route to the independent spool engine (straight-fan columns).
+        kind="spool",
     )
 
 
@@ -1418,10 +1436,8 @@ def tag_hangers(doc, view_name=None, retag_existing=False):
         avoid_categories=["MEP Fabrication Pipework", "Insulation"],
         retag_existing=retag_existing,
         layout="ganged",
-        avoid_obstacles=True,
-        # Hangers spread out with a standalone tag each where there is room,
-        # falling back to grouped columns only in crowded stretches.
-        standalone_first=True,
+        # Route to the independent hanger engine (standalone-first + doglegs).
+        kind="hanger",
     )
 
 
